@@ -3,48 +3,42 @@ import re
 import sys
 import argparse
 from typing import Dict, List, Optional, Union
-
-import logging
-logger = logging.getLogger(__name__)
+import torch
 
 _DEFAULT_MAX_SENTENCES_LENGTH = 10000
 
-_ZH_PUNCT_SPLIT = re.compile(r"(?<=[。！？…])")
-_FALLBACK_SPLIT_WS = re.compile(r"(?<=[\.\!\?…。！？])\s+")
-_FALLBACK_SPLIT_NO_WS = re.compile(r"(?<=[\.\!\?…。！？])")
+# split after end-of-sentence punctuation.
+# VI: split after sentence-ending punct OR at newlines
+_SPLIT_VI = re.compile(r"(?:(?<=[\.\!\?…]|[。！？…])\s*|\n+)")
+# ZH: split after CJK punct (optionally followed by closing quotes) OR at newlines
+_SPLIT_ZH = re.compile(r"(?:(?<=[。！？…])(?:[」』”’》〉）\]\}]+)?\s*|\n+)")
 
 _DROP_CHARS = str.maketrans({
-    "「":"", "」":"", "『":"", "』":"",
-    "〈":"", "〉":"", "《":"", "》":"",
-    "“":"", "”":"", "‘":"", "’":"",
-    "\"":"", "'":""
+    "「": "", "」": "", "『": "", "』": "",
+    "〈": "", "〉": "", "《": "", "》": "",
+    "“": "", "”": "", "‘": "", "’": "",
+    "\"": "", "'": "",
 })
+
 _PUNCT_ONLY = re.compile(r"^[\W_]+$", re.UNICODE)
 
-_STANZA_PIPES: Dict[str, object] = {}
-
-def split(file_path: Union[str, Path], 
-          lang: str, 
-          max_len: Optional[int] = _DEFAULT_MAX_SENTENCES_LENGTH) -> List[str]:
+def sent_split(file_path: Union[str, Path], lang: str, max_len: Optional[int] = _DEFAULT_MAX_SENTENCES_LENGTH) -> List[str]:
     lang = (lang or "").strip().lower()
     if lang not in {"vi", "zh"}:
         raise ValueError("lang must be 'vi' or 'zh'")
-
+    
+    # read file
     text = Path(file_path).read_text(encoding="utf-8", errors="replace")
     text = _normalize(text)
 
-    sents = _split_with_stanza(text, lang)
+    # split
+    sents = _split_by_punct(text, lang)
 
-    if lang == "zh" and sents:
-        sents = _post_split_zh(sents)
-
-    if not sents:
-        logger.warning("stanza returned no sentences -> regex fallback | file=%s lang=%s", file_path, lang)
-        sents = _split_fallback_regex(text)
-
+    # clean
     sents = [s.strip() for s in sents if s and s.strip()]
     sents = [s for s in sents if not _is_junk_sent(s)]
-    # Truncate very long sentences; max_len=None => unlimited
+
+    # truncate
     if max_len is not None:
         if max_len <= 0:
             raise ValueError("max_len must be a positive int or None")
@@ -52,6 +46,108 @@ def split(file_path: Union[str, Path],
 
     return sents
 
+def sent_split_tkn(
+    file_path: Union[str, Path],
+    tokenizer,
+    lang: str,
+    *,
+    max_len: Optional[int] = _DEFAULT_MAX_SENTENCES_LENGTH,
+    max_tokens: Optional[int] = None,
+    add_special_tokens: bool = True,
+) -> Dict[str, torch.Tensor]:
+    # split sentences
+    sents = sent_split(file_path, lang=lang, max_len=max_len)
+    if not sents:
+        return {
+            "input_ids": torch.empty((0, 0), dtype=torch.long),
+            "attention_mask": torch.empty((0, 0), dtype=torch.long),
+        }
+
+    # tokenize batch + pad
+    enc = tokenizer(
+        sents,
+        add_special_tokens=add_special_tokens,
+        padding=True,
+        truncation=(max_tokens is not None),
+        max_length=max_tokens,
+        return_tensors="pt",
+        return_attention_mask=True,
+    )
+
+    features = {
+        "input_ids": enc["input_ids"].long(),
+        "attention_mask": enc["attention_mask"].long(),
+    }
+
+    return features
+
+def chunk_split(file_path: Union[str, Path], tokenizer, chunk_size: int, overlap_size: int, *, max_tokens: int = 512) -> Dict[str, torch.Tensor]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+    if overlap_size < 0:
+        raise ValueError("overlap_size must be >= 0")
+    if overlap_size >= chunk_size:
+        raise ValueError("overlap_size must be < chunk_size")
+    
+    # Read file
+    text = Path(file_path).read_text(encoding="utf-8", errors="replace").strip()
+    text = _normalize(text)
+    if not text:
+        return {
+            "input_ids": torch.empty((0, 0), dtype=torch.long),
+            "attention_mask": torch.empty((0, 0), dtype=torch.long),
+        }
+    
+    # Tokenize full doc once (no truncation)
+    ids = tokenizer(text, add_special_tokens=False, truncation=False)["input_ids"]
+    if not ids:
+        return {
+            "input_ids": torch.empty((0, 0), dtype=torch.long),
+            "attention_mask": torch.empty((0, 0), dtype=torch.long),
+        }
+    
+    # Split (content tokens) + add special tokens later
+    cls_id = tokenizer.cls_token_id 
+    sep_id = tokenizer.sep_token_id
+    chunk_size = min(chunk_size, max_tokens - 2)
+    step = chunk_size - overlap_size
+    if step <= 0:
+        raise ValueError("overlap_size too large (step <= 0)")
+    chunks: List[List[int]] = []
+    for start in range(0, len(ids), step):
+        piece = ids[start:start + chunk_size]
+        if not piece:
+            break
+        piece = [cls_id] + piece + [sep_id]
+        chunks.append(piece)
+        if start + chunk_size >= len(ids):
+            break
+
+    if not chunks:
+        return {
+            "input_ids": torch.empty((0, 0), dtype=torch.long),
+            "attention_mask": torch.empty((0, 0), dtype=torch.long),
+        }
+    
+    # Padding + attention_mask
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = 0
+    
+    batch_size = len(chunks)
+    chunk_length = max(len(c) for c in chunks) # chunk_size + cls_id + sep_id
+    
+    input_ids = torch.full((batch_size, chunk_length), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((batch_size, chunk_length), dtype=torch.long)
+    
+    for i, c in enumerate(chunks):
+        l = len(c)
+        input_ids[i, :l] = torch.tensor(c, dtype=torch.long)
+        attention_mask[i, :l] = 1
+
+    return {"input_ids": input_ids,
+            "attention_mask": attention_mask}
+       
 def _normalize(text: str) -> str:
     text = text.lstrip("\ufeff")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -59,43 +155,16 @@ def _normalize(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
 
-def _get_stanza_pipe(lang: str):
-    if lang in _STANZA_PIPES:
-        return _STANZA_PIPES[lang]
+def _split_by_punct(text: str, lang: str) -> List[str]:
+    if not text:
+        return []
 
-    import stanza  # type: ignore
+    # primary split
+    if lang == "zh":
+        parts = _SPLIT_ZH.split(text)
+    else:
+        parts = _SPLIT_VI.split(text)
 
-    pipe = stanza.Pipeline(
-        lang=lang,
-        processors="tokenize",
-        tokenize_no_ssplit=False,
-        verbose=False,
-    )
-    _STANZA_PIPES[lang] = pipe
-    return pipe
-
-
-def _split_with_stanza(text: str, lang: str) -> Optional[List[str]]:
-    try:
-        pipe = _get_stanza_pipe(lang)
-        doc = pipe(text)
-        sents = [s.text for s in getattr(doc, "sentences", [])]
-        return sents or None
-    except Exception:
-        logger.debug("stanza split failed (%s): %s", lang, e)
-        return None
-
-def _post_split_zh(sents: List[str]) -> List[str]:
-    out: List[str] = []
-    for s in sents:
-        parts = _ZH_PUNCT_SPLIT.split(s)
-        out.extend([p.strip() for p in parts if p and p.strip()])
-    return out
-
-def _split_fallback_regex(text: str) -> List[str]:
-    parts = _FALLBACK_SPLIT_WS.split(text)
-    if len(parts) <= 1:
-        parts = _FALLBACK_SPLIT_NO_WS.split(text)
     return [p for p in parts if p and p.strip()]
     
 def _is_junk_sent(s: str) -> bool:
@@ -103,19 +172,3 @@ def _is_junk_sent(s: str) -> bool:
     if not s2:
         return True
     return bool(_PUNCT_ONLY.match(s2))
-    
-def _main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Sentence splitter (vi/zh) using stanza with regex fallback.")
-    parser.add_argument("-f", "--file", required=True, help="Input text file path (utf-8 recommended).")
-    parser.add_argument("-l", "--lang", required=True, choices=["vi", "zh"], help="Language: vi or zh.")
-    args = parser.parse_args(argv)
-
-    out = split(args.file, args.lang)
-    sys.stdout.write(out)
-    if out and not out.endswith("\n"):
-        sys.stdout.write("\n")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())

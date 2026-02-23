@@ -1,165 +1,162 @@
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union, Literal
-import math
+from typing import Dict, List, Optional, Union, Literal
 import numpy as np
-import re
-from collections import Counter
+import torch
+from transformers import AutoTokenizer
 
-from transformers import AutoTokenizer  # pip: transformers
+from .utils import iter_npy_stream, load_doc2idx_tsv
+from .generate_embeddings import DFCollector, SplitMode
+from .doc_split import sent_split_tkn, chunk_split
 
-from .doc_split import split as split_sents
-import logging, time
+import logging
 logger = logging.getLogger(__name__)
 
 Doc = Union[str, Path]
-
-# -----------------------
-# 0) Helpers: stream I/O
-# -----------------------
-def iter_npy_stream(path: Union[str, Path]) -> Iterable[np.ndarray]:
-    """
-    Yield arrays saved sequentially by repeated np.save(fd, arr).
-    """
-    with open(path, "rb") as f:
-        while True:
-            try:
-                arr = np.load(f, allow_pickle=False)
-            except EOFError:
-                break
-            except ValueError:
-                break
-            yield arr
-
-
-def load_doc2idx_tsv(path: Union[str, Path]) -> List[str]:
-    """
-    The file format is: idx<TAB>doc_path
-    Returns doc paths in embedding order.
-    """
-    out: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            _, p = line.split("\t", 1)
-            out.append(p)
-    return out
 
 
 # -----------------------
 # 1) Weight strategies
 # -----------------------
-def weights_lp(sents: List[str]) -> np.ndarray:
+def _normalize_weights(w: np.ndarray) -> np.ndarray:
+    w = w.astype(np.float32, copy=False)
+    if w.size == 0:
+        return w
+    s = float(w.sum())
+    if s <= 0:
+        return (np.ones_like(w, dtype=np.float32) / float(w.size)).astype(np.float32)
+    return (w / s).astype(np.float32)
+
+def cal_sl(
+    input_ids: torch.Tensor,                          # [B, L] or [L]
+    dfc: DFCollector,
+    *,
+    attention_mask: torch.Tensor | None = None,       # [B, L] or [L]
+    mode: str = "len",                                # "len" | "sqrt" | "log,                                        # L, sprt(L), log(L)  
+    is_normalize: bool = False,
+) -> np.ndarray:
+    """
+    Sentence-length weights per row (B,) for units/chunks in ONE document.
+    Length is computed over real tokens (attention_mask==1).
+    If is_normalize=True: normalize to sum=1 (fallback uniform).
+    """
+    skip = set(getattr(dfc, "skip_id", set()))
+    if input_ids.numel() == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    # allow [L] -> [1, L]
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+        if attention_mask is not None and attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+
+    B = int(input_ids.shape[0])
+    w = np.zeros((B,), dtype=np.float32)
+
+    for i in range(B):
+        ids_row = input_ids[i]
+        if attention_mask is not None:
+            ids_row = ids_row[attention_mask[i].bool()]
+
+        ids = [int(t) for t in ids_row.tolist() if int(t) not in skip]
+        L = len(ids)
+
+        if mode == "len":
+            val = float(L)
+        elif mode == "sqrt":
+            val = float(np.sqrt(L))
+        elif mode == "log":
+            val = float(np.log1p(L))  # log(1+L)
+        else:
+            raise ValueError("mode must be 'len', 'sqrt', or 'log'")
+
+        w[i] = val
+
+    return _normalize_weights(w) if is_normalize else w.astype(np.float32)
+
+
+
+def _idf(tid: int, N: int, df: Dict[int, int]) -> float:
+    # Smooth TF-IDF style (always > 0)
+    dfi = df.get(int(tid), 0)
+    return 1.0 + np.log((N + 1.0) / (dfi + 1.0))
+
+def cal_idf(
+    input_ids: torch.Tensor,                          # [B, L] or [L]
+    dfc: DFCollector,
+    *,
+    attention_mask: torch.Tensor | None = None,        # [B, L] or [L]
+    is_normalize: bool = False,
+) -> np.ndarray:
+    """
+    Weight per row (B,) for units/chunks in ONE document.
+    Each row weight = mean(IDF(tokens_in_row)), excluding df.skip_id and padding via attention_mask.
+    If is_normalize=True: normalize to sum=1 (fallback uniform).
+    """
+    N = int(dfc.N_docs)
+    df_map = dfc.df
+    skip = set(getattr(dfc, "skip_id", set()))
+
+    if input_ids.numel() == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    # allow [L] -> [1, L]
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+        if attention_mask is not None and attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+
+    B = int(input_ids.shape[0])
+    w = np.zeros((B,), dtype=np.float32)
+
+    for i in range(B):
+        ids_row = input_ids[i]
+        if attention_mask is not None:
+            ids_row = ids_row[attention_mask[i].bool()]  # keep only real tokens
+
+        ids = [int(t) for t in ids_row.tolist() if int(t) not in skip]
+        if not ids:
+            w[i] = 0.0
+            continue
+
+        vals = [_idf(t, N, df_map) for t in ids]
+        w[i] = float(np.mean(vals))
+
+    return _normalize_weights(w) if is_normalize else w.astype(np.float32)
+
+def weights_lp(input_ids: torch.Tensor, dfc: DFCollector , attention_mask: torch.Tensor) -> np.ndarray:
     """
     Length pooling: w_i proportional to sentence length in chars.
     Normalized to sum=1 within each doc.
     """
-    if not sents:
+    if input_ids.numel() == 0:
         return np.zeros((0,), dtype=np.float32)
-    lens = np.asarray([max(len(s), 1) for s in sents], dtype=np.float32)
-    s = float(lens.sum())
-    if s <= 0:
-        return np.ones((len(sents),), dtype=np.float32)
-    return (lens / s).astype(np.float32)
+    return cal_sl(input_ids, dfc, attention_mask = attention_mask, mode="len", is_normalize=True)
 
-
-def build_df_labse_subwords(
-    docs, langs, *, model_name="sentence-transformers/LaBSE", max_sent_len=10000
-):
-    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-    df = Counter()
-    N = len(docs)
-
-    for p, lg in zip(docs, langs):
-        sents = split_sents(str(p), lang=lg, max_len=max_sent_len)
-        if not sents:
-            continue
-
-        doc_token_ids = set()
-        
-        for s in sents:
-            enc = tok(
-                s,
-                add_special_tokens=False,
-                truncation=True,
-                max_length=tok.model_max_length,
-            )
-            doc_token_ids.update(enc["input_ids"])
-
-        for tid in doc_token_ids:
-            df[tid] += 1
-
-    return N, dict(df), tok
-
-
-def _idf(tid: int, N: int, df: Dict[int, int]) -> float:
-    dfi = df.get(tid, 0)
-    if dfi <= 0:
-        return 0.0
-    return 1.0 + math.log(N / float(dfi))
-
-
-def weights_token_idf_labse(
-    sents: List[str],
-    *,
-    tokenizer: object,
-    N: int,
-    df: Dict[int, int],
-) -> np.ndarray:
+def weights_token_idf(input_ids: torch.Tensor, dfc: DFCollector , attention_mask: torch.Tensor) -> np.ndarray:
     """
     Sentence weights from token-level IDF using LaBSE tokenizer:
       w_sent = mean_t idf(t)  , then normalize to sum=1 in doc
     """
-    if not sents:
+    if input_ids.numel() == 0:
         return np.zeros((0,), dtype=np.float32)
-
-    w = np.empty((len(sents),), dtype=np.float32)
-    for i, s in enumerate(sents):
-        ids = tokenizer(s, add_special_tokens=False)["input_ids"]
-        if not ids:
-            w[i] = 0.0
-            continue
-        vals = [_idf(tid, N, df) for tid in ids]
-        w[i] = float(np.mean(vals))
-    # Nomalize
-    sw = float(w.sum())
-    if sw <= 0:
-        return np.ones((len(sents),), dtype=np.float32)
-    return (w / sw).astype(np.float32)
+    return cal_idf(input_ids, dfc, attention_mask = attention_mask, is_normalize=True)
 
 
-def weights_token_lidf_labse(
-    sents: List[str],
-    *,
-    tokenizer: object,
-    N: int,
-    df: Dict[int, int],
-) -> np.ndarray:
+def weights_token_lidf(input_ids: torch.Tensor, dfc: DFCollector , attention_mask: torch.Tensor) -> np.ndarray:
     """
     LIDF variant:
       w_sent = mean_t idf(t) * len(tokens)
     then normalize to sum=1 in doc.
     """
-    if not sents:
+    if input_ids.numel() == 0:
         return np.zeros((0,), dtype=np.float32)
 
-    w = np.empty((len(sents),), dtype=np.float32)
-    for i, s in enumerate(sents):
-        ids = tokenizer(s, add_special_tokens=False)["input_ids"]
-        if not ids:
-            w[i] = 0.0
-            continue
-        idf_mean = float(np.mean([_idf(tid, N, df) for tid in ids]))
-        w[i] = idf_mean * float(len(ids))
-    # Nomalize
-    sw = float(w.sum())
-    if sw <= 0:
-        return np.ones((len(sents),), dtype=np.float32)
-    return (w / sw).astype(np.float32)
+    sl = cal_sl(input_ids, dfc, attention_mask=attention_mask, mode="len", is_normalize=False)
+    token_idf = cal_idf(input_ids, dfc, attention_mask=attention_mask, is_normalize=False)
+    w = sl * token_idf
+    return _normalize_weights(w)
 
-
-def apply_weights_repo_style(E: np.ndarray, w: Optional[np.ndarray]) -> np.ndarray:
+def apply_weights(E: np.ndarray, w: Optional[np.ndarray]) -> np.ndarray:
     """
     Repo-style: multiply each sentence vector by its scalar weight.
     Applies to ALL merge strategies.
@@ -237,74 +234,45 @@ def merge_topk_mean(E: np.ndarray, k: int = 16) -> np.ndarray:
     return E[idx].mean(axis=0, dtype=np.float32)
 
 
-ChunkMode = Literal["nonoverlap", "sliding"]
-SelectMode = Literal["head", "uniform", "topk_weight"]
-
-def _chunk_indices(n: int, k: int, *, mode: ChunkMode, stride: Optional[int]) -> List[np.ndarray]:
-    if k <= 0:
-        raise ValueError("sent_limit must be positive")
-    if n == 0:
-        return []
-
-    if mode == "nonoverlap":
-        # chunks: [0:k], [k:2k], ...
-        return [np.arange(i, min(i + k, n)) for i in range(0, n, k)]
-
-    # sliding
-    if stride is None:
-        stride = k  # default no overlap if not specified
-    if stride <= 0:
-        raise ValueError("stride must be positive")
-
-    out = []
-    i = 0
-    while i < n:
-        j = min(i + k, n)
-        out.append(np.arange(i, j))
-        if j == n:
-            break
-        i += stride
-    return out
-
 # -----------------------
 # 3) Main API
 # -----------------------
+
+WeightsStrategy = Literal["none", "lp", "idf", "lidf"]
+MergeStrategy = Literal["mean", "median", "max", "split3-max", "iter-mean", "topk-mean"]
+
 def compute_document_vectors_or_chunks(
     sent_emb_stream_path,
     doc2idx_path,
+    df_path,
+    split_mode: SplitMode,
     *,
+    weights_strategy: WeightsStrategy = "none",
+    merging_strategy: MergeStrategy = "mean",
+    strict_mismatch: bool = True,
+    # topk-mean parmas
+    topk: int = 15,
+    # sentence spliter params
     langs,
     max_sent_len: Optional[int] = 10000,
+    # chunk spliter params
+    chunk_size: int = 100,
+    overlap_rate: int = 0.5,
+    max_tokens: Optional[int] = None,                     # None => use model max_seq_length
+    # tokens params      
+    tok_name: str = "sentence-transformers/LaBSE",
 
-    weights_strategy: int = 0,              # 0 none, 1 LP, 2 token-IDF, 3 token-LIDF
-    labse_tokenizer_name: str = "sentence-transformers/LaBSE",
-
-    merging_strategy: int = 3,              # 1 mean,2 median,3 max,4 split3-max,5 iterative,6 topk-mean
-    topk: int = 16,
-
-    sent_limit: Optional[int] = None,       # None => per-doc vector; int => chunk vectors per doc
-    chunk_mode: ChunkMode = "nonoverlap",   # nonoverlap or sliding
-    stride: Optional[int] = None,           # only for sliding
-
-    # (optional) if you want to pick only some sentences BEFORE chunking (rarely needed)
-    # select_limit: Optional[int] = None,
-    # select_mode: SelectMode = "uniform",
-
-    strict_mismatch: bool = True,
 ):
     docs = load_doc2idx_tsv(doc2idx_path)
-    if len(docs) != len(langs):
-        raise ValueError("langs length must equal docs length from doc2idx")
+    if split_mode == "sentence":
+        if len(docs) != len(langs):
+            raise ValueError("langs length must equal docs length from doc2idx")
 
-    # Precompute DF once if needed
-    N = 0
-    df = {}
-    tokenizer = None
-    if weights_strategy in (2, 3):
-        N, df, tokenizer = build_df_labse_subwords(
-            docs, langs, model_name=labse_tokenizer_name, max_sent_len=max_sent_len
-        )
-
+    dfc = DFCollector.from_npz(df_path)
+    tok = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
+    if max_tokens is None:
+        ml = getattr(tok, "model_max_length", 512)
+        max_tokens = int(ml if isinstance(ml, int) and ml < 10000 else 512)
     outputs: List[np.ndarray] = []
 
     for i, E in enumerate(iter_npy_stream(sent_emb_stream_path)):
@@ -312,75 +280,59 @@ def compute_document_vectors_or_chunks(
         if E.ndim != 2:
             raise ValueError(f"Bad embedding array at doc #{i}: shape={E.shape}")
 
-        sents = split_sents(str(docs[i]), lang=langs[i], max_len=max_sent_len)
+        # get split
+        if split_mode == "sentence":
+            features = sent_split_tkn(docs[i], tok, langs[i], max_len=max_sent_len, max_tokens=max_tokens)
+        else:
+            overlap_size = int(chunk_size * overlap_rate)
+            features = chunk_split(docs[i], tok, chunk_size, overlap_size, max_tokens=max_tokens)
 
         # align count
-        if len(sents) != E.shape[0]:
-            msg = f"Sentence count mismatch at doc #{i}: split={len(sents)} emb={E.shape[0]} doc={docs[i]}"
+        n_units = int(features["input_ids"].shape[0])
+        if n_units != E.shape[0]:
+            msg = f"Unit count mismatch at doc #{i}: split={n_units} emb={E.shape[0]} doc={docs[i]}"
             if strict_mismatch:
                 raise ValueError(msg)
-            m = min(len(sents), E.shape[0])
-            sents = sents[:m]
+            m = min(n_units, E.shape[0])
+            # slice embeddings
             E = E[:m]
+            # slice features
+            features = {k: (v[:m] if hasattr(v, "shape") and v.shape[0] == n_units else v) for k, v in features.items()}
 
-        # compute weights for ALL sentences
+        # compute weights for ALL units
         w = None
-        if weights_strategy == 0:
+        if weights_strategy == "none":
             w = None
-        elif weights_strategy == 1:
-            w = weights_lp(sents)
-        elif weights_strategy == 2:
-            assert tokenizer is not None
-            w = weights_token_idf_labse(sents, tokenizer=tokenizer, N=N, df=df)
-        elif weights_strategy == 3:
-            assert tokenizer is not None
-            w = weights_token_lidf_labse(sents, tokenizer=tokenizer, N=N, df=df)
+        elif weights_strategy == "lp":
+            w = weights_lp(features["input_ids"], dfc, attention_mask=features.get("attention_mask"))
+        elif weights_strategy == "idf":
+            w = weights_token_idf(features["input_ids"], dfc, attention_mask=features.get("attention_mask"))
+        elif weights_strategy == "lidf":
+            w = weights_token_lidf(features["input_ids"], dfc, attention_mask=features.get("attention_mask"))
         else:
-            raise ValueError("weights_strategy must be 0..3")
+            raise ValueError("weights_strategy must be \"none\", \"lp\", \"idf\", \"lidf\"")
 
-        # helper: merge one chunk
-        def merge_one(E_chunk: np.ndarray, w_chunk: Optional[np.ndarray]) -> np.ndarray:
-            if w_chunk is not None:
-                if len(w_chunk) != E_chunk.shape[0]:
-                    raise ValueError("weights/E mismatch inside chunk")
-                E_chunk = apply_weights_repo_style(E_chunk, w_chunk)
-
-            if merging_strategy == 1:
-                return merge_mean(E_chunk)
-            elif merging_strategy == 2:
-                return merge_median(E_chunk)
-            elif merging_strategy == 3:
-                return merge_max(E_chunk)
-            elif merging_strategy == 4:
-                return merge_split3_max_concat(E_chunk)
-            elif merging_strategy == 5:
-                return merge_iterative_mean(E_chunk)
-            elif merging_strategy == 6:
-                return merge_topk_mean(E_chunk, k=topk)
+        if w is not None:
+            E = apply_weights(E, w)
+        
+        if merging_strategy == "mean":
+            if w is not None:
+                doc_vec = E.sum(axis=0, dtype=np.float32)   # weight is already normalize
             else:
-                raise ValueError("merging_strategy must be 1..6")
+                doc_vec = merge_mean(E)
+        elif merging_strategy == "median":
+            doc_vec = merge_median(E)
+        elif merging_strategy == "max":
+            doc_vec = merge_max(E)
+        elif merging_strategy == "split3-max":
+            doc_vec = merge_split3_max_concat(E)
+        elif merging_strategy == "iter-mean":
+            doc_vec = merge_iterative_mean(E)
+        elif merging_strategy == "topk-mean":
+            doc_vec = merge_topk_mean(E, k=topk)
+        else:
+            raise ValueError("merging_strategy must be \"mean\", \"median\", \"max\", \"split3-max\", \"iter-mean\", \"topk-mean\"")
 
-        # Case A: per-doc
-        if sent_limit is None:
-            v = merge_one(E, w)
-            outputs.append(v.astype(np.float32, copy=False))
-            continue
-
-        # Case B: per-doc chunks => (n_chunks, dim_or_3dim)
-        idx_chunks = _chunk_indices(E.shape[0], int(sent_limit), mode=chunk_mode, stride=stride)
-        if not idx_chunks:
-            # empty doc => 1 empty chunk vector (so shape consistent)
-            v0 = merge_one(E, w)
-            outputs.append(v0[None, :].astype(np.float32))
-            continue
-
-        chunk_vecs = []
-        for idxs in idx_chunks:
-            Ec = E[idxs]
-            wc = w[idxs] if w is not None else None
-            vc = merge_one(Ec, wc)
-            chunk_vecs.append(vc.astype(np.float32, copy=False))
-
-        outputs.append(np.stack(chunk_vecs, axis=0).astype(np.float32))
+        outputs.append(doc_vec.astype(np.float32))
 
     return outputs
