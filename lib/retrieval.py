@@ -1,42 +1,106 @@
+from typing import Literal
 import numpy as np
 import faiss
 
+ScoreMode = Literal["csls", "margin1", "cosine"]
+
 # -----------------------
-# Retrival
+# Retrieval
 # -----------------------
-def faiss_cos_search(
+def faiss_margin_search(
     query: np.ndarray,
     database: np.ndarray,
     *,
-    k: int = 5,
+    k: int = 10,                    # final top-k returned (after rerank)
+    retrieve_k: int | None = None,  # cosine candidates to consider (>=k). If None -> k
+    knn_k: int | None = None,       # kNN size to compute baselines r_q and/or r_d (recommend 10 or 20)
+    mode: ScoreMode = "csls",       # "cosine" | "margin1" | "csls"
+    batch_size: int = 4096,
 ):
-    query = np.asarray(query, dtype=np.float32)
-    database = np.asarray(database, dtype=np.float32)
+    """
+    Returns (D, I) like faiss.Index.search but with different scoring:
 
-    if database.ndim != 2:
-        raise ValueError(f"database must be 2D (m,d), got {database.shape}")
-    if query.ndim == 1:
-        query = query[None, :]
-    elif query.ndim != 2:
-        raise ValueError(f"query must be 1D or 2D, got {query.shape}")
+    - mode="cosine": D = cosine/IP
+    - mode="margin1": D = cos(q,y) - r_q(q)        (one-sided margin)
+    - mode="csls":   D = 2*cos(q,y) - r_q(q) - r_db(y) (two-sided CSLS)
+    """
+    Q = np.asarray(query, dtype=np.float32)
+    Y = np.asarray(database, dtype=np.float32)
 
-    d = database.shape[1]
-    if query.shape[1] != d:
-        raise ValueError(f"dim mismatch: query d={query.shape[1]} vs database d={d}")
+    if Y.ndim != 2:
+        raise ValueError(f"database must be 2D (m,d), got {Y.shape}")
+    if Q.ndim == 1:
+        Q = Q[None, :]
+    elif Q.ndim != 2:
+        raise ValueError(f"query must be 1D or 2D, got {Q.shape}")
+    if Q.shape[1] != Y.shape[1]:
+        raise ValueError(f"dim mismatch: query d={Q.shape[1]} vs database d={Y.shape[1]}")
+    if Y.shape[0] == 0:
+        return np.zeros((Q.shape[0], 0), np.float32), np.zeros((Q.shape[0], 0), np.int64)
+    if k <= 0:
+        return np.zeros((Q.shape[0], 0), np.float32), np.zeros((Q.shape[0], 0), np.int64)
 
-    # cosine = inner product of L2-normalized vectors
-    Xn = query.copy()
-    Yn = database.copy()
-    faiss.normalize_L2(Xn)
+    if retrieve_k is None or mode == "cosine":
+        retrieve_k = k
+    retrieve_k = min(int(retrieve_k), Y.shape[0])
+    k = min(int(k), retrieve_k)
+
+    if knn_k is None:
+        knn_k = retrieve_k
+    knn_k = min(int(knn_k), Y.shape[0])
+
+    # normalize for cosine=IP
+    Qn = np.ascontiguousarray(Q.copy())
+    Yn = np.ascontiguousarray(Y.copy())
+    faiss.normalize_L2(Qn)
     faiss.normalize_L2(Yn)
 
-    index = faiss.IndexFlatIP(d)
-    index.add(Yn)
+    d = Yn.shape[1]
+    indexY = faiss.IndexFlatIP(d)
+    indexY.add(Yn)
 
-    k_eff = min(int(k), Yn.shape[0])
-    D, I = index.search(Xn, k_eff)
-    return D, I
+    # cosine candidates
+    D_cos = np.empty((Qn.shape[0], retrieve_k), dtype=np.float32)
+    I_cos = np.empty((Qn.shape[0], retrieve_k), dtype=np.int64)
+    for s in range(0, Qn.shape[0], batch_size):
+        e = min(s + batch_size, Qn.shape[0])
+        D, I = indexY.search(Qn[s:e], retrieve_k)
+        D_cos[s:e] = D
+        I_cos[s:e] = I
 
+    if mode == "cosine":
+        return D_cos[:, :k].astype(np.float32), I_cos[:, :k].astype(np.int64)
+
+    # r_q(q): mean top-knn_k cosine from q to database
+    r_q = np.empty((Qn.shape[0],), dtype=np.float32)
+    for s in range(0, Qn.shape[0], batch_size):
+        e = min(s + batch_size, Qn.shape[0])
+        D, _ = indexY.search(Qn[s:e], knn_k)
+        r_q[s:e] = D.mean(axis=1)
+
+    if mode == "margin1":
+        D_score = D_cos - r_q[:, None]
+    elif mode == "csls":
+        # need r_db(y): mean top-knn_k cosine from y to queries
+        indexQ = faiss.IndexFlatIP(d)
+        indexQ.add(Qn)
+        knn_k_y = min(int(knn_k), Qn.shape[0])
+
+        r_db = np.empty((Yn.shape[0],), dtype=np.float32)
+        for s in range(0, Yn.shape[0], batch_size):
+            e = min(s + batch_size, Yn.shape[0])
+            D, _ = indexQ.search(Yn[s:e], knn_k_y)
+            r_db[s:e] = D.mean(axis=1)
+
+        D_score = 2.0 * D_cos - r_q[:, None] - r_db[I_cos]
+    else:
+        raise ValueError("mode must be one of: 'cosine', 'margin1', 'csls'")
+
+    order = np.argsort(-D_score, axis=1)
+    rows = np.arange(Qn.shape[0])[:, None]
+    I_sorted = I_cos[rows, order][:, :k]
+    D_sorted = D_score[rows, order][:, :k].astype(np.float32)
+    return D_sorted, I_sorted
 
 # -----------------------
 # Rerank
