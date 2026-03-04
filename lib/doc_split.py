@@ -52,6 +52,7 @@ def sent_split_tkn(
     lang: str,
     *,
     max_len: Optional[int] = _DEFAULT_MAX_SENTENCES_LENGTH,
+    num_of_sent: int = 1,
     max_tokens: Optional[int] = None,
     add_special_tokens: bool = True,
 ) -> Dict[str, torch.Tensor]:
@@ -63,6 +64,13 @@ def sent_split_tkn(
             "attention_mask": torch.empty((0, 0), dtype=torch.long),
         }
 
+    if num_of_sent > 1:
+        grouped_sents = []
+        for i in range(0, len(sents), num_of_sent):
+            group = sents[i : i + num_of_sen]
+            grouped_sents.append(" ".join(group))
+        sents = grouped_sents
+    
     # tokenize batch + pad
     enc = tokenizer(
         sents,
