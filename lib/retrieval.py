@@ -115,22 +115,42 @@ from .utils import iter_npy_stream, load_needed_from_stream
 
 
 @torch.no_grad()
-def bimax_score(
+def compute_bidirectional_scores(
     seg_embs_1: torch.Tensor,  # [n, d]
     seg_embs_2: torch.Tensor,  # [m, d]
     *,
     normalize: bool = True,
-    row_bs: int = 2048, # Row batch_size for mul
-    col_bs: int = 2048, # Col batch_size for mul
-) -> torch.Tensor:
+    trim_ratio: float = 1.0,   # Keep top K% matches
+    batch_size: int = 2048,
+) -> Tuple[float, float]:
     """
-    BiMax = 0.5*( mean_i max_j cos(x_i,y_j) + mean_j max_i cos(y_j,x_i) )
+    Computes bidirectional similarity scores between two sets of segment embeddings.
+    
+    This function calculates the coverage of seg_embs_1 by seg_embs_2 and vice versa,
+    returning raw scores for both directions without aggregation.
+
+    Args:
+        seg_embs_1: Tensor of shape [n, d], representing segments of Document 1.
+        seg_embs_2: Tensor of shape [m, d], representing segments of Document 2.
+        normalize: Whether to L2-normalize embeddings before dot product.
+        trim_ratio: Float (0.0 < ratio <= 1.0). If < 1.0, only the top K% best matching 
+                    segments are used to compute the mean score. This helps reduce noise 
+                    from irrelevant segments in long documents.
+        batch_size: Batch size for matrix multiplication to avoid OOM on GPUs.
+
+    Returns:
+        A tuple (score_1_to_2, score_2_to_1):
+        - score_1_to_2: Represents how well Document 1 is covered by Document 2.
+        - score_2_to_1: Represents how well Document 2 is covered by Document 1.
     """
+    # 1. Handle empty inputs
     if seg_embs_1.numel() == 0 or seg_embs_2.numel() == 0:
-        return seg_embs_1.new_tensor(0.0)
+        return 0.0, 0.0
 
     X = seg_embs_1
     Y = seg_embs_2
+    
+    # 2. Normalize embeddings
     if normalize:
         X = F.normalize(X, p=2, dim=1)
         Y = F.normalize(Y, p=2, dim=1)
@@ -138,23 +158,81 @@ def bimax_score(
     n = X.shape[0]
     m = Y.shape[0]
 
-    # X -> Y
-    row_max_parts = []
-    for i in range(0, n, row_bs):
-        sim = X[i:i + row_bs] @ Y.T
-        row_max_parts.append(sim.max(dim=1).values)
-    row_max = torch.cat(row_max_parts, dim=0)
-    s1 = row_max.mean()
+    # Helper function to compute trimmed mean
+    def get_trimmed_mean(vals: torch.Tensor, ratio: float) -> float:
+        if ratio >= 1.0:
+            return vals.mean().item()
+        # Ensure at least 1 segment is kept
+        k = max(1, int(len(vals) * ratio))
+        return torch.topk(vals, k).values.mean().item()
 
-    # Y -> X
-    col_max_parts = []
-    for j in range(0, m, col_bs):
-        sim = Y[j:j + col_bs] @ X.T
-        col_max_parts.append(sim.max(dim=1).values)
-    col_max = torch.cat(col_max_parts, dim=0)
-    s2 = col_max.mean()
+    # 3. Compute X -> Y (How well X is covered by Y)
+    # For each segment in X, find the best matching segment in Y.
+    row_max_vals = []
+    for i in range(0, n, batch_size):
+        end_i = min(i + batch_size, n)
+        # sim_chunk shape: [batch_size, m]
+        sim_chunk = torch.matmul(X[i:end_i], Y.T) 
+        # Max over dim=1 (columns/Y)
+        max_val, _ = torch.max(sim_chunk, dim=1)
+        row_max_vals.append(max_val)
+    
+    row_max = torch.cat(row_max_vals, dim=0)
+    s1 = get_trimmed_mean(row_max, trim_ratio)
 
-    return 0.5 * (s1 + s2)
+    # 4. Compute Y -> X (How well Y is covered by X)
+    # For each segment in Y, find the best matching segment in X.
+    col_max_vals = []
+    for j in range(0, m, batch_size):
+        end_j = min(j + batch_size, m)
+        # sim_chunk shape: [batch_size, n]
+        sim_chunk = torch.matmul(Y[j:end_j], X.T)
+        # Max over dim=1 (columns/X)
+        max_val, _ = torch.max(sim_chunk, dim=1)
+        col_max_vals.append(max_val)
+    
+    col_max = torch.cat(col_max_vals, dim=0)
+    s2 = get_trimmed_mean(col_max, trim_ratio)
+
+    return s1, s2
+
+
+def bimax_score(
+    seg_embs_1: torch.Tensor,
+    seg_embs_2: torch.Tensor,
+    *,
+    normalize: bool = True,
+    trim_ratio: float = 1.0,
+    batch_size: int = 2048,
+    aggregation: str = 'avg' # Options: 'avg', 'max', 'min'
+) -> float:
+    """
+    Wrapper for compute_bidirectional_scores that applies an aggregation strategy.
+    
+    Args:
+        aggregation: Strategy to combine the two directional scores.
+                     - 'avg': Standard BiMax (symmetric). Good for 1-1 alignment.
+                     - 'max': Returns the better of the two directions. Good for containment (M-N).
+                     - 'min': Strict matching. Both directions must be good.
+    
+    Returns:
+        A single scalar float score.
+    """
+    s1, s2 = compute_bidirectional_scores(
+        seg_embs_1, 
+        seg_embs_2, 
+        normalize=normalize, 
+        trim_ratio=trim_ratio, 
+        batch_size=batch_size
+    )
+    
+    if aggregation == 'max':
+        return max(s1, s2)
+    elif aggregation == 'min':
+        return min(s1, s2)
+    else:
+        # Default to average
+        return 0.5 * (s1 + s2)
 
 def rerank_bimax(
     I: np.ndarray,  # [N, k]
