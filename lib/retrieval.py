@@ -241,52 +241,58 @@ def rerank_bimax(
     tar_stream_path: Union[str, Path],
     device: str = "cpu",
     normalize: bool = True,
-    row_bs: int = 2048,
-    col_bs: int = 2048,
+    batch_size: int = 2048,
+    trim_ratio: float = 1.0,
+    aggregation: str = 'avg',
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Rerank FAISS candidates using 2-way BiMax.
-
-    Returns:
-      scores_sorted: [N, k] float32 (desc per row)
-      I_sorted:      [N, k] int64   (candidates reordered per row)
-    """
     I = np.asarray(I, dtype=np.int64)
     if I.ndim != 2:
         raise ValueError(f"I must be 2D (N,k), got {I.shape}")
     N, k = I.shape
     if N == 0 or k == 0:
         return np.zeros((N, k), dtype=np.float32), I
-
+    
     # Preload target embedding
     cand_idx = set(int(x) for x in I.reshape(-1).tolist())
     tar_map = load_needed_from_stream(tar_stream_path, cand_idx)
-
+    
     scores = np.zeros((N, k), dtype=np.float32)
-
     count_src = 0
+    
     # stream through src docs; assume src stream order aligns with query row index
     for qi, src_arr in enumerate(iter_npy_stream(src_stream_path)):
         if qi >= N:
             raise ValueError(f"index is missmatch")
         count_src += 1
+        
         A_np = np.asarray(src_arr, dtype=np.float32)
         if A_np.ndim != 2:
             raise ValueError(f"src doc #{qi} chunks must be 2D (n,d), got {A_np.shape}")
-        A = torch.from_numpy(np.asarray(src_arr, dtype=np.float32)).to(device)
+        
+        A = torch.from_numpy(A_np).to(device)
+        
         # Get set of cand from I[qi]
         for cj in range(k):
             ti = int(I[qi, cj])
             B_np = tar_map.get(ti)
             if B_np is None:
                 raise ValueError(f"Target idx {ti} not found in tar_stream (needed by query {qi})")
+            
             B = torch.from_numpy(B_np).to(device)
+            
+            s = bimax_score(A, B, 
+                normalize=normalize, 
+                trim_ratio=trim_ratio, 
+                batch_size=batch_size, 
+                aggregation=aggregation
+            )
+            scores[qi, cj] = float(s)
 
-            s = bimax_score(A, B, normalize=normalize, row_bs=row_bs, col_bs=col_bs)
-            scores[qi, cj] = float(s.item())
     if count_src < N:
         raise ValueError(f"src_stream has only {count_src} docs but I has N={N}")
+    
     # Rerank per query
     order = np.argsort(-scores, axis=1)
     rows = np.arange(N)[:, None]
+    
     return scores[rows, order].astype(np.float32), I[rows, order].astype(np.int64)
