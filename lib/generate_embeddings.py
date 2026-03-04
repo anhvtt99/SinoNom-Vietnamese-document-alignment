@@ -379,10 +379,12 @@ def _process_per_doc(
     embeddings_output: Union[str, Path],
     model_name: str,
     *,
+    doc2idx_path: Optional[Union[str, Path]] = None,
     split_mode: SplitMode = "sentence",
     batch_size: int = 32,                 # minibatch inside model.encode
+    # sentence split params (only when split_mode="sentence")
+    num_of_sent: int = 1,
     max_sent_len: Optional[int] = 10000,  # None => unlimited
-    doc2idx_path: Optional[Union[str, Path]] = None,
     # chunk split params (only when split_mode="chunk")
     chunk_size: int = 100,
     overlap_rate: int = 0.5,
@@ -431,7 +433,7 @@ def _process_per_doc(
 
             # get split
             if split_mode == "sentence":
-                features = sent_split_tkn(doc, tok, lang, max_len=max_sent_len, max_tokens=max_tokens)
+                features = sent_split_tkn(doc, tok, lang, max_len=max_sent_len, max_tokens=max_tokens, num_of_sent=num_of_sent)
             else:
                 overlap_size = int(chunk_size * overlap_rate)
                 features = chunk_split(doc, tok, chunk_size, overlap_size, max_tokens=max_tokens)
@@ -472,6 +474,7 @@ def process(
     mode: Mode = "per_doc",
     batch_size: int = 32,
     max_sent_len: Optional[int] = 10000,
+    num_of_sent: int = 1,
     max_mbytes_per_batch: Optional[float] = 200.0,
     max_nolines_per_batch: Optional[int] = 200000,
     doc2idx_path: Optional[Union[str, Path]] = None,
@@ -492,6 +495,7 @@ def process(
             model_name=model_name,
             batch_size=batch_size,
             max_sent_len=max_sent_len,
+            num_of_sent=num_of_sent,
             doc2idx_path=doc2idx_path,
             chunk_size=chunk_size, overlap_rate= overlap_rate,
             max_tokens = max_tokens,
