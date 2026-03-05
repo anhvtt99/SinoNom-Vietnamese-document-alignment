@@ -1,3 +1,4 @@
+import os
 from typing import Union, Iterable, List, Dict
 from pathlib import Path
 import numpy as np
@@ -87,3 +88,10 @@ def get_torch_device(prefer_cuda: bool = True) -> torch.device:
     Returns torch.device('cuda') if prefer_cuda and available, else 'cpu'.
     """
     return torch.device("cuda") if (prefer_cuda and torch.cuda.is_available()) else torch.device("cpu")
+
+# -----------------------
+# Helpers: function for normalization path
+# -----------------------
+def get_filename_only(path_str: str) -> str:
+    """Returns 'document.txt' from '/path/to/data/document.txt'"""
+    return os.path.basename(path_str)
