@@ -1,65 +1,103 @@
 import os
-from typing import Union, Iterable, List, Dict
+from typing import Union, Iterable, List, Dict, Any
 from pathlib import Path
+import json
+
+import pandas as pd
 import numpy as np
 import torch
 
 # -----------------------
 # Helpers: stream I/O
 # -----------------------
-def iter_npy_stream(path: Union[str, Path]) -> Iterable[np.ndarray]:
-    """
-    Yield arrays saved sequentially by repeated np.save(fd, arr).
-    """
-    with open(path, "rb") as f:
-        while True:
-            try:
-                arr = np.load(f, allow_pickle=False)
-            except EOFError:
-                break
-            except ValueError:
-                break
-            yield arr
+class AlignerIO:
+    """Support read/write file system for Aligner."""
+    
+    @staticmethod
+    def save_config(path: Union[str, Path], config_data: Dict[str, Any]):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        with open(path / "config.json", "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=4, ensure_ascii=False)
 
+    @staticmethod
+    def load_config(path: Union[str, Path]) -> Dict[str, Any]:
+        with open(Path(path) / "config.json", "r", encoding="utf-8") as f:
+            return json.load(f)
 
-def load_needed_from_stream(
-    stream_path: Union[str, Path],
-    need_indices: Iterable[int],
-) -> Dict[int, np.ndarray]:
-    """
-    Scan stream once and load only arrays whose index is in need_indices.
-    Each stream item is expected to be (n_chunks, dim) float32.
-    """
-    need = set(int(x) for x in need_indices)
-    out: Dict[int, np.ndarray] = {}
-    if not need:
-        return out
+    @staticmethod
+    def save_metadata(path: Union[str, Path], doc2idx_data: List[Dict[str, Any]]):
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(doc2idx_data)
+        df.to_csv(path / "doc2idx.tsv", sep='\t', index=False)
 
-    for i, arr in enumerate(iter_npy_stream(stream_path)):
-        if i in need:
-            out[i] = np.asarray(arr, dtype=np.float32)
-            if len(out) == len(need):
-                break
+    @staticmethod
+    def load_metadata(path: Union[str, Path]) -> pd.DataFrame:
+        return pd.read_csv(Path(path) / "doc2idx.tsv", sep='\t')
 
-    missing = need - set(out.keys())
-    if missing:
-        raise ValueError(f"Missing indices in chunk stream: {sorted(missing)[:10]} ...")
-    return out
+    @staticmethod
+    def load_doc_embedding(embeddings_dir: Union[str, Path], emb_file_name: str) -> np.ndarray:
+        """Load an embedding from given embedding file name."""
+        return np.load(Path(embeddings_dir) / emb_file_name).astype('float32')
 
-def load_doc2idx_tsv(path: Union[str, Path]) -> List[str]:
-    """
-    The file format is: idx<TAB>doc_path
-    Returns doc paths in embedding order.
-    """
-    out: List[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            _, p = line.split("\t", 1)
-            out.append(p)
-    return out
+    @staticmethod
+    def load_all_embeddings(embeddings_dir: Union[str, Path], df_meta: pd.DataFrame) -> List[np.ndarray]:
+        """Load all embedding base on metadata."""
+        embeddings_dir = Path(embeddings_dir)
+        return [np.load(embeddings_dir / f).astype('float32') for f in df_meta['emb_file']]
+
+    @staticmethod
+    def get_path_by_idx(meta_df: pd.DataFrame, idx: int) -> str:
+        """Get path of doc base on idx."""
+        try:
+            return meta_df.loc[idx, "file_path"]
+        except KeyError:
+            return None
+
+    @staticmethod
+    def get_emb_by_idx(meta_df: pd.DataFrame, embeddings_dir: Union[str, Path], idx: int) -> np.ndarray:
+        """Load embedding base on doc_idx."""
+        try:
+            emb_file = meta_df.loc[idx, "emb_file"]
+            return np.load(Path(embeddings_dir) / emb_file).astype('float32')
+        except KeyError:
+            return None
+
+    @staticmethod
+    def get_info_by_idx(meta_df: pd.DataFrame, idx: int) -> Dict[str, Any]:
+        """Load all info (path, filename, n_chunks) base on idx."""
+        try:
+            return meta_df.loc[idx].to_dict()
+        except KeyError:
+            return None
+    
+    @staticmethod
+    def get_embs_by_indices(
+        meta_df: pd.DataFrame, 
+        embeddings_dir: Union[str, Path], 
+        indices: List[int]
+    ) -> Dict[int, np.ndarray]:
+        """
+        Load many embedding base on given list of index.
+        """
+        embeddings_dir = Path(embeddings_dir)
+        results = {}
+        
+        unique_indices = list(set(indices))
+        
+        valid_indices = meta_df.index.intersection(unique_indices)
+        needed_meta = meta_df.loc[valid_indices]
+
+        for idx, row in needed_meta.iterrows():
+            emb_file_path = embeddings_dir / row['emb_file']
+            if emb_file_path.exists():
+                results[idx] = np.load(emb_file_path).astype('float32')
+            else:
+                print(f"Warning: File {emb_file_path} không tồn tại.")
+        
+        return results
+
 
 # -----------------------
 # Helpers: Check if CUDA is available

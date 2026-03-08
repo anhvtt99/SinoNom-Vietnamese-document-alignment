@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from .utils import load_doc2idx_tsv
+from .utils import AlignerIO
 
 # -----------------------
 # Metric
@@ -43,65 +43,66 @@ def load_ground_truth(
     
     return ground_truth
 
-def calculate_f1(
-    pred_pairs_indices: List[Tuple[int, int]],
-    src_map_path: Union[str, Path],
-    tgt_map_path: Union[str, Path],
+def eval(
+    pred_pairs_indices: List[Union[Tuple[int, int], Tuple[int, int, float]]],
+    src_meta_path: Union[str, Path],
+    tgt_meta_path: Union[str, Path],
     gold_file_path: Union[str, Path],
     normalize_fn: Optional[Callable[[str], str]] = None
 ) -> Dict[str, Any]:
     """
-    Calculate Precision, Recall, F1 and return detailed lists of TP, FP, FN.
-
-    Returns:
-        Dict with keys: 
-        - Metrics: 'precision', 'recall', 'f1'
-        - Counts: 'tp_count', 'fp_count', 'fn_count'
-        - Lists: 'tp_list', 'fp_list', 'fn_list' (List of (src_path, tgt_path) tuples)
+    Calculate Precision, Recall, F1-score and return detailed lists of TP, FP, FN.
+    Uses AlignerIO to dynamically map indices to actual file paths.
     """
     
-    # 1. Load Mappings
-    print("Loading mappings...")
-    src_paths = load_doc2idx_tsv(src_map_path)
-    tgt_paths = load_doc2idx_tsv(tgt_map_path)
+    # 1. Load Mappings (Metadata)
+    print("[*] Loading metadata mappings...")
+    # set_index('doc_idx') allows ultra-fast O(1) lookups for paths later
+    src_meta_df = AlignerIO.load_metadata(src_meta_path).set_index('doc_idx')
+    tgt_meta_df = AlignerIO.load_metadata(tgt_meta_path).set_index('doc_idx')
 
     # 2. Load Ground Truth (Gold Standard)
-    print("Loading ground truth...")
+    print("[*] Loading ground truth...")
+    # Assumes load_ground_truth returns a set of (src_path, tgt_path) tuples
     gold_set = load_ground_truth(gold_file_path, normalize_fn=normalize_fn)
     
-    # 3. Convert Predictions (Indices -> Paths)
-    print("Converting predictions...")
+    # 3. Convert Predictions (Indices -> Paths) and Store Scores
+    print("[*] Converting predicted indices to file paths...")
     pred_set = set()
+    pred_scores = {}
     
-    for src_idx, tgt_idx in pred_pairs_indices:
-        # Check bounds
-        if src_idx < 0 or src_idx >= len(src_paths):
-            continue
-        if tgt_idx < 0 or tgt_idx >= len(tgt_paths):
+    for item in pred_pairs_indices:
+        src_idx = item[0]
+        tgt_idx = item[1]
+        score = item[2] if len(item) > 2 else None
+        
+        # Fast lookup using AlignerIO. Returns None if idx doesn't exist.
+        s_p = AlignerIO.get_path_by_idx(src_meta_df, src_idx)
+        t_p = AlignerIO.get_path_by_idx(tgt_meta_df, tgt_idx)
+        
+        # Skip this pair if either source or target index is invalid/missing
+        if s_p is None or t_p is None:
             continue
             
-        s_p = src_paths[src_idx]
-        t_p = tgt_paths[tgt_idx]
-        
-        # Normalize paths if needed
+        # Normalize paths if a function is provided (e.g., removing .txt extensions)
         if normalize_fn:
             s_p = normalize_fn(s_p)
             t_p = normalize_fn(t_p)
             
-        pred_set.add((s_p, t_p))
+        pair = (s_p, t_p)
+        pred_set.add(pair)
+        
+        # Keep track of the score (MaxSim/CSLS) for deeper error analysis
+        if score is not None:
+            pred_scores[pair] = score
 
-    # 4. Calculate Sets
-    
-    # True Positives: Pairs in BOTH Pred and Gold (Giao nhau)
+    # 4. Calculate True Positives (TP), False Positives (FP), False Negatives (FN)
+    # Using Python's built-in Set operations for maximum performance
     tp_set = pred_set.intersection(gold_set)
-    
-    # False Positives: Pairs in Pred BUT NOT in Gold
     fp_set = pred_set.difference(gold_set)
-    
-    # False Negatives: Pairs in Gold BUT NOT in Pred
     fn_set = gold_set.difference(pred_set)
     
-    # 5. Calculate Metrics
+    # 5. Calculate Standard Metrics
     tp_count = len(tp_set)
     fp_count = len(fp_set)
     fn_count = len(fn_set)
@@ -113,23 +114,33 @@ def calculate_f1(
     if (precision + recall) > 0:
         f1 = 2 * (precision * recall) / (precision + recall)
 
+    # 6. Format Detailed Lists for Output
+    def format_list_with_scores(pair_set: set) -> List:
+        """Helper to attach scores back to the pairs for debugging."""
+        sorted_pairs = sorted(list(pair_set))
+        if not pred_scores:
+            return sorted_pairs
+        return [(s, t, pred_scores.get((s, t), None)) for s, t in sorted_pairs]
+
+    print(f"[+] Evaluation completed: F1={f1:.4f} | Precision={precision:.4f} | Recall={recall:.4f}")
+
     return {
-        # Metrics
+        # Core Metrics
         "precision": precision,
         "recall": recall,
         "f1": f1,
         
-        # Counts
+        # Raw Counts
         "tp": tp_count,
         "fp": fp_count,
         "fn": fn_count,
         "total_gold": len(gold_set),
         "total_pred": len(pred_set),
         
-        # Detailed Lists (Convert sets back to sorted lists for readability)
-        "tp_list": sorted(list(tp_set)),
-        "fp_list": sorted(list(fp_set)),
-        "fn_list": sorted(list(fn_set))
+        # Detailed Lists (Great for writing error analysis in your thesis)
+        "tp_list": format_list_with_scores(tp_set),
+        "fp_list": format_list_with_scores(fp_set),
+        "fn_list": sorted(list(fn_set)) # FN implies we missed it, so we don't have a predicted score for it
     }
  
 # -----------------------
@@ -175,8 +186,8 @@ def plot_confusion_matrix(metrics: dict, figsize: Tuple[int, int] = (7, 6)):
     
     # Create 2x2 matrix, TN = 0 or NaN
     cm = np.array([
-        [0, fp],   # Hàng 0: Actual Negative (TN ẩn, FP hiện)
-        [fn, tp]   # Hàng 1: Actual Positive (FN hiện, TP hiện)
+        [0, fp],  
+        [fn, tp]  
     ])
     
 

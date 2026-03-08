@@ -1,104 +1,21 @@
 from pathlib import Path
-from typing import List, Optional, Sequence, Union, Iterable, Literal, Dict, Set
-from collections import Counter
+from typing import List, Optional, Sequence, Union, Iterable, Literal, Dict
 import os
-import numpy as np
 
+import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer
 
+from .utils import AlignerIO
 from .doc_split import sent_split_tkn, chunk_split
 
-import logging, time
-logger = logging.getLogger(__name__)
 
 Doc = Union[str, Path]
 Mode = Literal["per_doc", "rolling"]
 SplitMode = Literal["sentence", "chunk"]
 
-class DFCollector:
-    """
-    Collect document frequency over tokenizer subword ids.
-    df[token_id] = number of docs where token_id appears at least once.
-    """
-    def __init__(self, N_docs: int = 0, df: Counter | None = None, skip_id: Set[int] | None = None):
-        self.N_docs = int(N_docs)
-        self.df = df if df is not None else Counter()
-        self.skip_id: Set[int] = set(skip_id) if skip_id is not None else set()
-
-    def set_skip_id(self, skip_id: Set[int]) -> None:
-        self.skip_id = set(skip_id)
-
-    def update_from_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-    ) -> None:
-        """Update DF using token IDs from ONE document."""
-        self.N_docs += 1
-
-        if input_ids.numel() == 0:
-            return
-
-        if attention_mask is None:
-            ids = input_ids.reshape(-1).tolist()
-        else:
-            ids = input_ids[attention_mask.bool()].tolist()
-
-        for tid in set(ids):
-            tid = int(tid)
-            if tid not in self.skip_id:
-                self.df[tid] += 1
-
-    def save_npz(self, out_path: Union[str, Path]) -> None:
-        """
-        Save DF to a compressed NPZ:
-          - N_docs: int64
-          - token_ids: int32 array
-          - df: int32 array (same length as token_ids)
-          - skip_id: int32 array
-        """
-        out_path = Path(out_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        token_ids = np.fromiter(self.df.keys(), dtype=np.int32, count=len(self.df))
-        dfs = np.fromiter((self.df[k] for k in self.df.keys()), dtype=np.int32, count=len(self.df))
-        skip = np.array(sorted(self.skip_id), dtype=np.int32)
-
-        np.savez_compressed(out_path, N_docs=np.int64(self.N_docs), token_ids=token_ids, df=dfs, skip_id=skip)
-
-        logger.info("df: saved | N_docs=%d | uniq_tokens=%d | skip=%d | path=%s",
-                    self.N_docs, len(token_ids), skip.shape[0], str(out_path))
-
-    @classmethod
-    def from_npz(cls, path: Union[str, Path]) -> "DFCollector":
-        """Load DFCollector from npz file."""
-        path = Path(path)
-        z = np.load(path)
-
-        N = int(z["N_docs"])
-        token_ids = z["token_ids"].astype(np.int32)
-        dfs = z["df"].astype(np.int32)
-
-        # backward-compatible: old files might not have skip_id
-        if "skip_id" in z.files:
-            skip_id = set(map(int, z["skip_id"].astype(np.int32).tolist()))
-        else:
-            skip_id = set()
-
-        if token_ids.shape[0] != dfs.shape[0]:
-            raise ValueError(f"Bad df file: token_ids and df length mismatch: {token_ids.shape[0]} vs {dfs.shape[0]}")
-
-        c = Counter({int(t): int(v) for t, v in zip(token_ids, dfs)})
-        obj = cls(N_docs=N, df=c, skip_id=skip_id)
-
-        logger.info("df: loaded | N_docs=%d | uniq_tokens=%d | skip=%d | path=%s",
-                    obj.N_docs, len(obj.df), len(obj.skip_id), str(path))
-        return obj
-
 def st_encode_features(
-    model,
+    model: SentenceTransformer,
     features: Dict[str, torch.Tensor],
     *,
     batch_size: int = 32,
@@ -142,32 +59,32 @@ def _get_file_size_bytes(p: Doc) -> int:
         return 0
 
 
-def _iter_doc_batches_by_size(
-    docs: Sequence[Doc],
-    max_mbytes_per_batch: Optional[float],
-) -> Iterable[List[Doc]]:
-    """
-    Yield batches of docs based on total file size (best-effort).
-    """
-    if max_mbytes_per_batch is None or max_mbytes_per_batch < 0:
-        yield list(docs)
-        return
+# def _iter_doc_batches_by_size(
+#     docs: Sequence[Doc],
+#     max_mbytes_per_batch: Optional[float],
+# ) -> Iterable[List[Doc]]:
+#     """
+#     Yield batches of docs based on total file size (best-effort).
+#     """
+#     if max_mbytes_per_batch is None or max_mbytes_per_batch < 0:
+#         yield list(docs)
+#         return
 
-    max_bytes = int(max_mbytes_per_batch * 1024 * 1024)
-    batch: List[Doc] = []
-    acc = 0
+#     max_bytes = int(max_mbytes_per_batch * 1024 * 1024)
+#     batch: List[Doc] = []
+#     acc = 0
 
-    for d in docs:
-        sz = _get_file_size_bytes(d)
-        if batch and acc + sz > max_bytes:
-            yield batch
-            batch = []
-            acc = 0
-        batch.append(d)
-        acc += sz
+#     for d in docs:
+#         sz = _get_file_size_bytes(d)
+#         if batch and acc + sz > max_bytes:
+#             yield batch
+#             batch = []
+#             acc = 0
+#         batch.append(d)
+#         acc += sz
 
-    if batch:
-        yield batch
+#     if batch:
+#         yield batch
 
 # [TBD]
 # def _process_rolling(
@@ -375,27 +292,22 @@ def _iter_doc_batches_by_size(
 
 def _process_per_doc(
     docs: Sequence[Doc],
-    langs: Sequence[str],
     embeddings_output: Union[str, Path],
-    model_name: str,
+    lang: str,
+    model: SentenceTransformer,
     *,
-    doc2idx_path: Optional[Union[str, Path]] = None,
+    normalize_embeddings: bool = True,
     split_mode: SplitMode = "sentence",
     batch_size: int = 32,                 # minibatch inside model.encode
     # sentence split params (only when split_mode="sentence")
     num_of_sent: int = 1,
+    overlap_sent: int = 0,
     max_sent_len: Optional[int] = 10000,  # None => unlimited
     # chunk split params (only when split_mode="chunk")
     chunk_size: int = 100,
     overlap_rate: int = 0.5,
     max_tokens: Optional[int] = None,                     # None => use model max_seq_length  
-    # DF
-    collect_df: bool = False,
-    df_out_path: Optional[Union[str, Path]] = None,
-    df_tokenizer_name: Optional[str] = None,          # None => use model_name tokenizer 
 ) -> None:
-    if len(docs) != len(langs):
-        raise ValueError("docs and langs must have the same length")
     if not docs:
         raise ValueError("docs is empty")
     if batch_size <= 0:
@@ -403,81 +315,93 @@ def _process_per_doc(
     if split_mode ==  "chunk" and (overlap_rate < 0 or overlap_rate >= 1):
         raise ValueError("overlap_rate is invalid for chunk split")  
 
-    model = SentenceTransformer(model_name)
+    if split_mode == "sentence":
+        config_tag = f'{split_mode}_n{num_of_sent}_o{overlap_sent}'
+    else:
+        config_tag = f'{split_mode}_s{chunk_size}_r{overlap_rate}'
+
+    tok = model.tokenizer
     max_tokens = max_tokens if max_tokens is not None else model.max_seq_length
 
-    out_path = Path(embeddings_output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if doc2idx_path is None:
-        doc2idx_path = out_path.with_suffix(out_path.suffix + ".doc2idx.tsv")
-    doc2idx_path = Path(doc2idx_path)
-    doc2idx_path.parent.mkdir(parents=True, exist_ok=True)
+    # Setup Path
+    print(f"[{config_tag}] Constructing embedding output file system...")
+    lang_path = Path(embeddings_output) / config_tag / lang
+    embeddings_dir = lang_path / "embeddings"
+    meta_dir = lang_path / "metadata"
+    
+    embeddings_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    
+    doc2idx_data = []
+    
+    print(f"[{config_tag}] Processing {len(docs)} documents for lang: {lang}...")
+    for idx, (doc) in enumerate(docs):
+        # get split
+        if split_mode == "sentence":
+            features = sent_split_tkn(doc, tok, lang, max_len=max_sent_len, max_tokens=max_tokens, num_of_sent=num_of_sent, overlap_sent=overlap_sent)
+        else:
+            overlap_size = int(chunk_size * overlap_rate)
+            features = chunk_split(doc, tok, chunk_size, overlap_size, max_tokens=max_tokens)
 
-    tok_name = df_tokenizer_name or model_name
-    tok = AutoTokenizer.from_pretrained(tok_name, use_fast=True)
+        emb_doc = st_encode_features(
+            model,
+            features,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=normalize_embeddings,
+        )
+        original_stem = doc.stem
+        emb_file_name = f"{original_stem}.npy"
+        np.save(embeddings_dir / emb_file_name, emb_doc)
 
-    dfc = None
-    if collect_df:
-        logger.info("Collect document frequency enable")        
-        dfc = DFCollector()
-    skip_id = []
-    for x in (tok.pad_token_id, tok.cls_token_id, tok.sep_token_id, tok.bos_token_id, tok.eos_token_id):
-        if x is not None:
-            skip_id.append(int(x))
-    dfc.set_skip_id(set(skip_id))
+        doc2idx_data.append({
+            "doc_idx": idx,
+            "file_path": str(doc),
+            "emb_file": emb_file_name,
+            "n_chunks": emb_doc.shape[0]
+        })
+    # Save doc2idx.tsv
+    AlignerIO.save_metadata(meta_dir, doc2idx_data)
+    
+    # Save config.json
+    if split_mode == "sentence":
+        config_data = {
+                "model_name": model.model_card_data.base_model,
+                "normalize": normalize_embeddings,
+                "split_mode": split_mode,
+                "num_of_sent": num_of_sent,
+                "overlap_sent": overlap_sent,
+                "max_sent_len": max_sent_len,
+        }
+    else:
+        config_data = {
+                "model_name": model.model_card_data.base_model,
+                "normalize": normalize_embeddings,
+                "split_mode": split_mode,
+                "chunk_size": chunk_size,
+                "overlap_rate": overlap_rate,
+                "max_tokens": max_tokens,
+        }
+    AlignerIO.save_config(lang_path, config_data)
 
-    with open(out_path, "wb") as out_fd, open(doc2idx_path, "w", encoding="utf-8") as map_fd:
-        for idx, (doc, lang) in enumerate(zip(docs, langs)):
-            doc = str(doc)
-
-            # get split
-            if split_mode == "sentence":
-                features = sent_split_tkn(doc, tok, lang, max_len=max_sent_len, max_tokens=max_tokens, num_of_sent=num_of_sent)
-            else:
-                overlap_size = int(chunk_size * overlap_rate)
-                features = chunk_split(doc, tok, chunk_size, overlap_size, max_tokens=max_tokens)
-
-            # collect DF
-            if dfc is not None:
-                dfc.update_from_input_ids(
-                    features["input_ids"],
-                    attention_mask=features.get("attention_mask")
-                )
-
-            # encode -> (n_sent, dim)
-            emb_doc = st_encode_features(
-                model,
-                features,
-                batch_size=batch_size,
-                convert_to_numpy=True,
-                normalize_embeddings=False,
-            )
-
-            # store one array per doc
-            np.save(out_fd, emb_doc)
-            map_fd.write(f"{idx}\t{doc}\n")
-
-    # Save DFCollector
-    if dfc is not None:
-        if df_out_path is None:
-            df_out_path = out_path.with_suffix(out_path.suffix + ".df.npz")
-        dfc.save_npz(df_out_path)
+    print(f"Done! Embeddings saved to {embeddings_dir}")
 
 def process(
     docs: Sequence[Doc],
-    langs: Sequence[str],
+    lang: str,
     embeddings_output: Union[str, Path],
-    model_name: str,
+    model: SentenceTransformer,
     *,
+    normalize_embeddings: bool = True,
     split_mode: SplitMode = "sentence",
     mode: Mode = "per_doc",
     batch_size: int = 32,
     max_sent_len: Optional[int] = 10000,
     num_of_sent: int = 1,
+    overlap_sent: int = 0,
     max_mbytes_per_batch: Optional[float] = 200.0,
     max_nolines_per_batch: Optional[int] = 200000,
-    doc2idx_path: Optional[Union[str, Path]] = None,
     chunk_size: int = 100,
     overlap_rate: int = 0.5,
     max_tokens: Optional[int] = None,
@@ -490,16 +414,15 @@ def process(
     """
     if mode == "per_doc":
         return _process_per_doc(
-            docs, langs, embeddings_output, 
+            docs, embeddings_output, lang,
+            normalize_embeddings=normalize_embeddings,
             split_mode=split_mode,
-            model_name=model_name,
+            model=model,
             batch_size=batch_size,
             max_sent_len=max_sent_len,
-            num_of_sent=num_of_sent,
-            doc2idx_path=doc2idx_path,
+            num_of_sent=num_of_sent, overlap_sent=overlap_sent,
             chunk_size=chunk_size, overlap_rate= overlap_rate,
             max_tokens = max_tokens,
-            collect_df = collect_df, df_out_path = df_out_path, df_tokenizer_name = df_tokenizer_name
         )
     # [TBD]
     # elif mode == "rolling":

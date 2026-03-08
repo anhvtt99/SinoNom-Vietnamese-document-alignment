@@ -1,106 +1,176 @@
-from typing import Literal
+from typing import Literal, Optional, List, Union, Tuple
+from pathlib import Path
+from collections import Counter
+
 import numpy as np
+import pandas as pd
 import faiss
+
+from .utils import AlignerIO
+
 
 ScoreMode = Literal["csls", "margin1", "cosine"]
 
 # -----------------------
 # Retrieval
 # -----------------------
-def faiss_margin_search(
-    query: np.ndarray,
-    database: np.ndarray,
-    *,
-    k: int = 10,                    # final top-k returned (after rerank)
-    retrieve_k: int | None = None,  # cosine candidates to consider (>=k). If None -> k
-    knn_k: int | None = None,       # kNN size to compute baselines r_q and/or r_d (recommend 10 or 20)
-    mode: ScoreMode = "csls",       # "cosine" | "margin1" | "csls"
-    batch_size: int = 4096,
-):
+class VotingParentRetriever:
+    def __init__(self):
+        self.index: Optional[faiss.Index] = None
+        self.chunk2doc: Optional[np.ndarray] = None
+        self.meta_df: Optional[pd.DataFrame] = None
+        self.dim: int = 0
+
+    def load_target_corpus(self, lang_path: Union[str, Path]):
+        """
+        Phase 1: Load the entire Target Corpus into RAM and build the FAISS Index.
+        
+        Args:
+            lang_path: Path to the target language folder.
+        """
+        lang_path = Path(lang_path)
+        embeddings_dir = lang_path / "embeddings"
+        meta_dir = lang_path / "metadata" 
+        
+        # Load metadata containing document paths and chunk counts
+        self.meta_df = AlignerIO.load_metadata(meta_dir)
+        
+        all_chunks = []
+        chunk2doc_list = []
+        
+        for _, row in self.meta_df.iterrows():
+            emb_file = embeddings_dir / row['emb_file']
+            if not emb_file.exists():
+                print(f"[Warning] Missing file: {emb_file}")
+                continue
+                
+            # Load the embedding matrix of the document. Shape: [n_chunks, dim]
+            emb_matrix = AlignerIO.load_doc_embedding(embeddings_dir, row['emb_file'])
+            all_chunks.append(emb_matrix)
+            
+            # Create the mapping: Repeat the 'doc_idx' for the number of chunks it has.
+            # E.g., if doc 0 has 3 chunks, we append [0, 0, 0]
+            chunk2doc_list.extend([row['doc_idx']] * int(row['n_chunks']))
+            
+        # Flatten the list of 2D matrices into a single massive 2D matrix
+        X = np.vstack(all_chunks)
+        
+        # Convert the mapping list to a Numpy array for O(1) lookups later
+        self.chunk2doc = np.array(chunk2doc_list, dtype=np.int64)
+        self.dim = X.shape[1]
+        
+        print(f"[*] Building FAISS IndexFlatIP for {X.shape[0]} chunks...")
+        
+        # Use Inner Product (IP) since vectors are already L2 Normalized (equivalent to Cosine Similarity)
+        self.index = faiss.IndexFlatIP(self.dim)
+        self.index.add(X)
+        
+        print(f"[+] Done! Index is ready. Total target documents: {len(self.meta_df)}")
+
+    def retrieve(self, query_chunks: np.ndarray, top_k_chunks: int = 5, top_k_docs: int = 10) -> List[Tuple[int, int]]:
+        """
+        Phase 2 & 3: Multi-Query Search and Plurality Voting (Hit Count).
+        
+        Args:
+            query_chunks: Matrix [num_chunks_in_source, dim] of the source document.
+            top_k_chunks: Number of nearest neighbors to retrieve for EACH source chunk.
+            top_k_docs: Number of top parent documents to return based on vote count.
+            
+        Returns:
+            A list of tuples: [(target_doc_idx, total_votes), ...]
+        """
+        if self.index is None:
+            raise RuntimeError("Index not built. Call load_target_corpus() first.")
+            
+        # FAISS strictly requires float32
+        query_chunks = query_chunks.astype('float32')
+        
+        # 1. SEARCH: Query all source chunks simultaneously (Parallel Search)
+        # 'I' is the Indices matrix. Shape: [num_chunks_in_source, top_k_chunks]
+        # It contains the FAISS internal IDs of the most similar target chunks.
+        scores, I = self.index.search(query_chunks, k=top_k_chunks)
+        
+        # 2. FILTER & FLATTEN: Remove missing neighbors (-1) and flatten the matrix
+        valid_I = I[I != -1]
+        
+        # 3. MAP-BACK: Translate FAISS internal Chunk IDs to Parent Document IDs
+        # This uses Numpy Advanced Indexing to map thousands of IDs instantly
+        hit_docs = self.chunk2doc[valid_I]
+        
+        # 4. AGGREGATE (Hit Count): Count how many times each parent document was "hit"
+        vote_counter = Counter(hit_docs.tolist())
+        
+        # Return the most frequently hit documents
+        return vote_counter.most_common(top_k_docs)
+
+    def get_doc_info(self, doc_idx: int) -> dict:
+        """Utility function to retrieve metadata for a specific document index."""
+        row = self.meta_df[self.meta_df['doc_idx'] == doc_idx].iloc[0]
+        return row.to_dict()
+
+
+def build_retrieval_matrix(
+    source_lang_path: Union[str, Path],
+    target_lang_path: Union[str, Path],
+    top_k_chunks: int = 5,
+    top_k_docs: int = 10
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Returns (D, I) like faiss.Index.search but with different scoring:
-
-    - mode="cosine": D = cosine/IP
-    - mode="margin1": D = cos(q,y) - r_q(q)        (one-sided margin)
-    - mode="csls":   D = 2*cos(q,y) - r_q(q) - r_db(y) (two-sided CSLS)
+    Wrapper for the Retriever to process all documents in the corpus.
+    Returns matrices matching the FAISS API format: (Scores/Votes, Indices).
     """
-    Q = np.asarray(query, dtype=np.float32)
-    Y = np.asarray(database, dtype=np.float32)
+    source_lang_path = Path(source_lang_path)
+    source_meta_path = source_lang_path / "metadata"
+    source_emb_dir = source_lang_path / "embeddings"
 
-    if Y.ndim != 2:
-        raise ValueError(f"database must be 2D (m,d), got {Y.shape}")
-    if Q.ndim == 1:
-        Q = Q[None, :]
-    elif Q.ndim != 2:
-        raise ValueError(f"query must be 1D or 2D, got {Q.shape}")
-    if Q.shape[1] != Y.shape[1]:
-        raise ValueError(f"dim mismatch: query d={Q.shape[1]} vs database d={Y.shape[1]}")
-    if Y.shape[0] == 0:
-        return np.zeros((Q.shape[0], 0), np.float32), np.zeros((Q.shape[0], 0), np.int64)
-    if k <= 0:
-        return np.zeros((Q.shape[0], 0), np.float32), np.zeros((Q.shape[0], 0), np.int64)
-
-    if retrieve_k is None or mode == "cosine":
-        retrieve_k = k
-    retrieve_k = min(int(retrieve_k), Y.shape[0])
-    k = min(int(k), retrieve_k)
-
-    if knn_k is None:
-        knn_k = retrieve_k
-    knn_k = min(int(knn_k), Y.shape[0])
-
-    # normalize for cosine=IP
-    Qn = np.ascontiguousarray(Q.copy())
-    Yn = np.ascontiguousarray(Y.copy())
-    faiss.normalize_L2(Qn)
-    faiss.normalize_L2(Yn)
-
-    d = Yn.shape[1]
-    indexY = faiss.IndexFlatIP(d)
-    indexY.add(Yn)
-
-    # cosine candidates
-    D_cos = np.empty((Qn.shape[0], retrieve_k), dtype=np.float32)
-    I_cos = np.empty((Qn.shape[0], retrieve_k), dtype=np.int64)
-    for s in range(0, Qn.shape[0], batch_size):
-        e = min(s + batch_size, Qn.shape[0])
-        D, I = indexY.search(Qn[s:e], retrieve_k)
-        D_cos[s:e] = D
-        I_cos[s:e] = I
-
-    if mode == "cosine":
-        return D_cos[:, :k].astype(np.float32), I_cos[:, :k].astype(np.int64)
-
-    # r_q(q): mean top-knn_k cosine from q to database
-    r_q = np.empty((Qn.shape[0],), dtype=np.float32)
-    for s in range(0, Qn.shape[0], batch_size):
-        e = min(s + batch_size, Qn.shape[0])
-        D, _ = indexY.search(Qn[s:e], knn_k)
-        r_q[s:e] = D.mean(axis=1)
-
-    if mode == "margin1":
-        D_score = D_cos - r_q[:, None]
-    elif mode == "csls":
-        # need r_db(y): mean top-knn_k cosine from y to queries
-        indexQ = faiss.IndexFlatIP(d)
-        indexQ.add(Qn)
-        knn_k_y = min(int(knn_k), Qn.shape[0])
-
-        r_db = np.empty((Yn.shape[0],), dtype=np.float32)
-        for s in range(0, Yn.shape[0], batch_size):
-            e = min(s + batch_size, Yn.shape[0])
-            D, _ = indexQ.search(Yn[s:e], knn_k_y)
-            r_db[s:e] = D.mean(axis=1)
-
-        D_score = 2.0 * D_cos - r_q[:, None] - r_db[I_cos]
-    else:
-        raise ValueError("mode must be one of: 'cosine', 'margin1', 'csls'")
-
-    order = np.argsort(-D_score, axis=1)
-    rows = np.arange(Qn.shape[0])[:, None]
-    I_sorted = I_cos[rows, order][:, :k]
-    D_sorted = D_score[rows, order][:, :k].astype(np.float32)
-    return D_sorted, I_sorted
+    # Load target index
+    retriever = VotingParentRetriever()
+    retriever.load_target_corpus(target_lang_path)
+    
+    # Find the maximum document index to set the matrix size.
+    # Use max() + 1 to prevent errors if some doc_idx are missing in the middle.
+    source_meta_df = AlignerIO.load_metadata(source_meta_path)
+    N_source = source_meta_df['doc_idx'].max() + 1
+    
+    # Initialize empty matrices.
+    # I_matrix stores Target Document IDs (-1 means no target found).
+    # V_matrix stores the Vote Counts (0 means no votes).
+    I_matrix = np.full((N_source, top_k_docs), -1, dtype=np.int64)
+    V_matrix = np.full((N_source, top_k_docs), 0, dtype=np.float32)
+    
+    total_docs = len(source_meta_df)
+    print(f"[*] Building retrieval matrix for {total_docs} documents...")
+    
+    # Loop through each document in the source metadata
+    for i, (_, row) in enumerate(source_meta_df.iterrows()):
+        src_idx = row['doc_idx']
+        
+        # Print a simple progress update every 100 documents
+        if (i + 1) % 100 == 0:
+            print(f"    Processing {i + 1}/{total_docs}...")
+        
+        # 1. Load the chunk embeddings for the current source document
+        src_emb_matrix = AlignerIO.load_doc_embedding(source_emb_dir, row['emb_file'])
+        
+        # 2. Query the Retriever
+        # Returns a list of tuples: [(target_idx_1, votes_1), ...]
+        candidates = retriever.retrieve(
+            src_emb_matrix, 
+            top_k_chunks=top_k_chunks, 
+            top_k_docs=top_k_docs
+        )
+        
+        # 3. Fill the results into the pre-allocated matrices
+        for rank, (target_idx, votes) in enumerate(candidates):
+            if rank >= top_k_docs:
+                break
+            I_matrix[src_idx, rank] = target_idx
+            V_matrix[src_idx, rank] = votes
+            
+    print("[+] Retrieval matrix completed!")
+    
+    # Return V_matrix (Scores) and I_matrix (Indices) just like FAISS (D, I)
+    return V_matrix, I_matrix
 
 # -----------------------
 # Rerank
@@ -212,7 +282,7 @@ def bimax_score(
     Args:
         aggregation: Strategy to combine the two directional scores.
                      - 'avg': Standard BiMax (symmetric). Good for 1-1 alignment.
-                     - 'max': Returns the better of the two directions. Good for containment (M-N).
+                     - 'max': Returns the better of the two directions. Good for containment (1-N/N-1).
                      - 'min': Strict matching. Both directions must be good.
     
     Returns:
@@ -235,64 +305,98 @@ def bimax_score(
         return 0.5 * (s1 + s2)
 
 def rerank_bimax(
-    I: np.ndarray,  # [N, k]
+    I: np.ndarray,  # Matrix from FAISS [N, k]
+    source_lang_path: Union[str, Path],
+    target_lang_path: Union[str, Path],
     *,
-    src_stream_path: Union[str, Path],
-    tar_stream_path: Union[str, Path],
     device: str = "cpu",
-    normalize: bool = True,
+    normalize: bool = False,
     batch_size: int = 2048,
     trim_ratio: float = 1.0,
     aggregation: str = 'avg',
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Rerank the candidates retrieved by FAISS using detailed MaxSim/Bimax scoring.
+    Loads data dynamically from the standard Aligner file system.
+    
+    Returns:
+        D_sorted, I_sorted: The updated score matrix and indices, sorted descending.
+    """
     I = np.asarray(I, dtype=np.int64)
     if I.ndim != 2:
         raise ValueError(f"I must be 2D (N,k), got {I.shape}")
+        
     N, k = I.shape
     if N == 0 or k == 0:
         return np.zeros((N, k), dtype=np.float32), I
+
+    # 1. Setup paths
+    source_lang_path = Path(source_lang_path)
+    target_lang_path = Path(target_lang_path)
     
-    # Preload target embedding
-    cand_idx = set(int(x) for x in I.reshape(-1).tolist())
-    tar_map = load_needed_from_stream(tar_stream_path, cand_idx)
-    
-    scores = np.zeros((N, k), dtype=np.float32)
-    count_src = 0
-    
-    # stream through src docs; assume src stream order aligns with query row index
-    for qi, src_arr in enumerate(iter_npy_stream(src_stream_path)):
-        if qi >= N:
-            raise ValueError(f"index is missmatch")
-        count_src += 1
+    src_emb_dir = source_lang_path / "embeddings"
+    tar_emb_dir = target_lang_path / "embeddings"
+
+    # 2. Load metadata and set 'doc_idx' as the index
+    src_meta_df = AlignerIO.load_metadata(source_lang_path / "metadata").set_index('doc_idx')
+    tar_meta_df = AlignerIO.load_metadata(target_lang_path / "metadata").set_index('doc_idx')
+
+    # Initialize score matrix with a very low number (-1e9) for invalid/missing pairs
+    scores = np.full((N, k), -1e9, dtype=np.float32)
+
+    print(f"[*] Starting Bimax Reranking for {N} documents...")
+
+    # 3. Process each query document
+    for src_idx in range(N):
+        if (src_idx + 1) % 100 == 0:
+            print(f"    Reranking {src_idx + 1}/{N}...")
+
+        candidate_indices = I[src_idx]
         
-        A_np = np.asarray(src_arr, dtype=np.float32)
-        if A_np.ndim != 2:
-            raise ValueError(f"src doc #{qi} chunks must be 2D (n,d), got {A_np.shape}")
-        
+        # Filter out invalid indices (-1 from FAISS)
+        valid_cands = [idx for idx in candidate_indices if idx != -1]
+        if not valid_cands:
+            continue
+
+        # --- LOAD SOURCE ---
+        try:
+            src_file = src_meta_df.loc[src_idx, 'emb_file']
+            A_np = AlignerIO.load_doc_embedding(src_emb_dir, src_file)
+        except KeyError:
+            # Source doc_idx doesn't exist in metadata (e.g., missing file)
+            continue
+            
         A = torch.from_numpy(A_np).to(device)
-        
-        # Get set of cand from I[qi]
-        for cj in range(k):
-            ti = int(I[qi, cj])
-            B_np = tar_map.get(ti)
-            if B_np is None:
-                raise ValueError(f"Target idx {ti} not found in tar_stream (needed by query {qi})")
-            
+
+        # --- LOAD TARGETS (BATCH CACHE) ---
+        # Fetch all candidate embeddings for this query at once to minimize I/O overhead
+        tar_embs_dict = AlignerIO.get_embs_by_indices(tar_meta_df, tar_emb_dir, valid_cands)
+
+        # --- CALCULATE SCORES ---
+        for col_idx, tar_idx in enumerate(candidate_indices):
+            if tar_idx == -1 or tar_idx not in tar_embs_dict:
+                continue
+
+            B_np = tar_embs_dict[tar_idx]
             B = torch.from_numpy(B_np).to(device)
-            
-            s = bimax_score(A, B, 
+
+            # Core scoring logic
+            s = bimax_score(
+                A, B, 
                 normalize=normalize, 
                 trim_ratio=trim_ratio, 
                 batch_size=batch_size, 
                 aggregation=aggregation
             )
-            scores[qi, cj] = float(s)
+            scores[src_idx, col_idx] = float(s)
 
-    if count_src < N:
-        raise ValueError(f"src_stream has only {count_src} docs but I has N={N}")
-    
-    # Rerank per query
+    print("[+] Reranking completed!")
+
+    # 4. Sort the results per query (Row-wise descending sort)
     order = np.argsort(-scores, axis=1)
     rows = np.arange(N)[:, None]
     
-    return scores[rows, order].astype(np.float32), I[rows, order].astype(np.int64)
+    D_sorted = scores[rows, order].astype(np.float32)
+    I_sorted = I[rows, order].astype(np.int64)
+
+    return D_sorted, I_sorted

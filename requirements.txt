@@ -1,2 +1,3 @@
+matplotlib_venn
 sentence-transformers
 faiss-cpu

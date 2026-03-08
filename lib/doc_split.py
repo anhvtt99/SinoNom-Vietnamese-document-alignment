@@ -53,6 +53,7 @@ def sent_split_tkn(
     *,
     max_len: Optional[int] = _DEFAULT_MAX_SENTENCES_LENGTH,
     num_of_sent: int = 1,
+    overlap_sent: int = 0,
     max_tokens: Optional[int] = None,
     add_special_tokens: bool = True,
 ) -> Dict[str, torch.Tensor]:
@@ -66,9 +67,14 @@ def sent_split_tkn(
 
     if num_of_sent > 1:
         grouped_sents = []
-        for i in range(0, len(sents), num_of_sent):
-            group = sents[i : i + num_of_sen]
-            grouped_sents.append(" ".join(group))
+        # (stride) = num_of_sent - overlap_sent
+        stride = max(1, num_of_sent - overlap_sent)
+        for i in range(0, len(sents), stride):
+            group = sents[i : i + num_of_sent]
+            if group:
+                grouped_sents.append(" ".join(group))
+            if i + num_of_sent >= len(sents):
+                break
         sents = grouped_sents
     
     # tokenize batch + pad
