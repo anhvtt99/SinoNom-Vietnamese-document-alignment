@@ -425,8 +425,15 @@ def compute_csls(
     k_A = min(knn_k, D_A.shape[1])
     k_B = min(knn_k, D_B.shape[1])
 
-    r_A = np.mean(D_A[:, :k_A], axis=1) # Shape: [N_A]
-    r_B = np.mean(D_B[:, :k_B], axis=1) # Shape: [N_B]
+    valid_mask_A = I_A[:, :k_A] != -1
+    D_A_masked = np.where(valid_mask_A, D_A[:, :k_A], np.nan)
+    r_A = np.nanmean(D_A_masked, axis=1)
+    r_A = np.nan_to_num(r_A, nan=0.0)
+
+    valid_mask_B = I_B[:, :k_B] != -1
+    D_B_masked = np.where(valid_mask_B, D_B[:, :k_B], np.nan)
+    r_B = np.nanmean(D_B_masked, axis=1)
+    r_B = np.nan_to_num(r_B, nan=0.0)
 
     # --- STEP 2: Extract all valid edges from Direction A -> B ---
     valid_A = I_A != -1
@@ -478,5 +485,4 @@ def compute_csls(
         n_cands = len(group)
         D_out[x_val, :n_cands] = group['score'].values
         I_out[x_val, :n_cands] = group['y'].values
-
     return D_out, I_out
