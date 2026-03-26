@@ -4,7 +4,7 @@ import numpy as np
 from typing import List, Tuple
 from pathlib import Path
 
-from .utils import get_filename_only, AlignerIO
+from .utils import get_filename_only, AlignerIO, cuda_available
 from .retrieval import build_retrieval_matrix, rerank_bimax, compute_csls
 from .eval import eval, plot_confusion_matrix
 
@@ -62,7 +62,8 @@ def main():
 
     # --- SETUP PATHS ---
     base_path = Path(args.emb_base_path)
-    
+    is_gpu = cuda_available(verbose=False)
+    device = "cuda" if is_gpu else "cpu"
     if args.split_mode == "sentence":
         config_tag = f'{args.split_mode}_n{args.num_of_sent}_o{args.overlap_sent}'
     else:
@@ -97,8 +98,8 @@ def main():
 
     # --- STAGE 2: RERANKING (BIMAX) ---
     print("[2/3] Performing Bimax Reranking...")
-    D_trg, I_trg_reranked = rerank_bimax(I_trg, src_emb_path, trg_emb_path, normalize=False, trim_ratio=args.bimax_trim_ratio, aggregation="max")
-    D_src, I_src_reranked = rerank_bimax(I_src, trg_emb_path, src_emb_path, normalize=False, trim_ratio=args.bimax_trim_ratio, aggregation="max")
+    D_trg, I_trg_reranked = rerank_bimax(I_trg, src_emb_path, trg_emb_path, normalize=False, trim_ratio=args.bimax_trim_ratio, device=device, aggregation="max")
+    D_src, I_src_reranked = rerank_bimax(I_src, trg_emb_path, src_emb_path, normalize=False, trim_ratio=args.bimax_trim_ratio, device=device,  aggregation="max")
 
     # --- STAGE 3: CSLS MARGIN & EDGE EXTRACTION ---
     print("[3/3] Computing CSLS Margin and Extracting Edges...")
