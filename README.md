@@ -2,6 +2,15 @@
 
 Follow these steps to run the complete text alignment pipeline (from embedding generation to final alignment results) with a single command.
 
+### 0. Environment Setup
+It is recommended to use a virtual environment or Google Colab. You can install all necessary dependencies using the following commands.
+
+#### Install Dependencies
+Once you have cloned the repository, install all required packages using the provided `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
 ### 1. Data Preparation
 Organize your raw text files (`.txt`) and ground truth labels according to the following directory structure:
 

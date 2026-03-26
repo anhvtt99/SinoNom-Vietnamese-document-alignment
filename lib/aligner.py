@@ -121,8 +121,8 @@ def main():
             t_display = get_filename_only(t_name)
             named_pairs.append((s_display, t_display, score))
     if args.save_results:
-        final_out_path = Path(args.output_path) if args.output_path \
-                         else Path.cwd() / f"alignment_{config_tag}.tsv"
+        final_out_path = Path(args.output_path) / f"alignment_{config_tag}.tsv" \
+                         if args.output_path else Path.cwd() / f"alignment_{config_tag}.tsv"
         
         final_out_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -151,7 +151,7 @@ def main():
         
         if args.viz:
             if args.output_path:
-                output_viz_path = Path(args.output_path)
+                output_viz_path = Path(args.output_path) / f"confusion_matrix_{config_tag}.png"
             else:
                 output_viz_path = Path.cwd() / f"confusion_matrix_{config_tag}.png"
             
