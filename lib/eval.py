@@ -1,11 +1,10 @@
-import os
 from pathlib import Path
 from typing import List, Tuple, Union, Set, Dict, Optional, Callable, Any
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from .utils import AlignerIO
+from utils import AlignerIO
 
 # -----------------------
 # Metric
@@ -148,7 +147,7 @@ def eval(
 # -----------------------
 
 # Venn Diagram
-def plot_alignment_venn(metrics: Dict[str, float], figsize: Tuple[int, int] = (8, 6)):
+def plot_alignment_venn(metrics: Dict[str, float], figsize: Tuple[int, int] = (8, 6), save_path=None):
     """
     Plot Venn diagram to visualize the connection between Ground Truth và Prediction.
     """
@@ -176,10 +175,15 @@ def plot_alignment_venn(metrics: Dict[str, float], figsize: Tuple[int, int] = (8
     # Subset (1, 1): Intersection (True Positive)
     
     plt.title("Alignment Overlap (Venn Diagram)")
-    plt.show()
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        print(f"[eval] Plot saved to {save_path}")
+    else:
+        plt.show()
     
  
-def plot_confusion_matrix(metrics: dict, figsize: Tuple[int, int] = (7, 6)):
+def plot_confusion_matrix(metrics: dict, figsize: Tuple[int, int] = (7, 6), save_path=None):
     tp = metrics.get('tp', 0)
     fp = metrics.get('fp', 0)
     fn = metrics.get('fn', 0)
@@ -217,4 +221,9 @@ def plot_confusion_matrix(metrics: dict, figsize: Tuple[int, int] = (7, 6)):
     plt.title("Alignment Matrix (Ignoring True Negatives)")
     plt.xlabel("Predicted")
     plt.ylabel("Actual")
-    plt.show()
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        print(f"[eval] Plot saved to {save_path}")
+    else:
+        plt.show()

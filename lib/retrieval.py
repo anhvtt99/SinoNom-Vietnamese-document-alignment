@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import faiss
 
-from .utils import AlignerIO
+from utils import AlignerIO
 
 
 ScoreMode = Literal["csls", "margin1", "cosine"]
@@ -180,8 +180,6 @@ from pathlib import Path
 from typing import Union, Tuple
 import torch
 import torch.nn.functional as F
-
-from .utils import iter_npy_stream, load_needed_from_stream
 
 
 @torch.no_grad()
@@ -400,3 +398,91 @@ def rerank_bimax(
     I_sorted = I[rows, order].astype(np.int64)
 
     return D_sorted, I_sorted
+
+
+# Compute margin score 
+def compute_csls(
+    D_A: np.ndarray, I_A: np.ndarray,
+    D_B: np.ndarray, I_B: np.ndarray,
+    knn_k: int = 10,
+    top_k_out: int = 10
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculate bi-directional CSLS (Margin) scores by combining candidates from both directions.
+    Formula: CSLS(x, y) = 2 * Cosine(x, y) - margin(x) - margin(y)
+
+    Args:
+        D_A, I_A: Scores and Indices from Source -> Target (Shape: [N_A, K])
+        D_B, I_B: Scores and Indices from Target -> Source (Shape: [N_B, K])
+        knn_k: Number of neighbors used to calculate the margin penalty.
+        top_k_out: Number of final candidates to return for each Source document.
+    """
+    N_A = D_A.shape[0]
+    N_B = D_B.shape[0]
+
+    # --- STEP 1: Calculate margin penalties ---
+    # margin(x) and margin(y) are the average scores of the top-k neighbors
+    k_A = min(knn_k, D_A.shape[1])
+    k_B = min(knn_k, D_B.shape[1])
+
+    valid_mask_A = I_A[:, :k_A] != -1
+    D_A_masked = np.where(valid_mask_A, D_A[:, :k_A], np.nan)
+    r_A = np.nanmean(D_A_masked, axis=1)
+    r_A = np.nan_to_num(r_A, nan=0.0)
+
+    valid_mask_B = I_B[:, :k_B] != -1
+    D_B_masked = np.where(valid_mask_B, D_B[:, :k_B], np.nan)
+    r_B = np.nanmean(D_B_masked, axis=1)
+    r_B = np.nan_to_num(r_B, nan=0.0)
+
+    # --- STEP 2: Extract all valid edges from Direction A -> B ---
+    valid_A = I_A != -1
+    x_A = np.repeat(np.arange(N_A), D_A.shape[1])[valid_A.flatten()]
+    y_A = I_A[valid_A]
+    scores_A = D_A[valid_A]
+
+    # --- STEP 3: Extract all valid edges from Direction B -> A ---
+    valid_B = I_B != -1
+    y_B = np.repeat(np.arange(N_B), D_B.shape[1])[valid_B.flatten()]
+    x_B = I_B[valid_B]
+    scores_B = D_B[valid_B]
+
+    # --- STEP 4: Merge pairs from both directions (Union of Edges) ---
+    x_all = np.concatenate([x_A, x_B])
+    y_all = np.concatenate([y_A, y_B])
+    scores_all = np.concatenate([scores_A, scores_B])
+
+    # --- STEP 5: Remove duplicate pairs ---
+    # Create a unique ID for each (x, y) pair to easily find duplicates
+    pair_keys = x_all * N_B + y_all
+    _, unique_indices = np.unique(pair_keys, return_index=True)
+
+    x_uniq = x_all[unique_indices]
+    y_uniq = y_all[unique_indices]
+    base_scores = scores_all[unique_indices]
+
+    # --- STEP 6: Apply the CSLS Formula ---
+    # Penalize "Hub" documents that are too close to everything
+    csls_scores = 2.0 * base_scores - r_A[x_uniq] - r_B[y_uniq]
+
+    # --- STEP 7: Rebuild and sort the output matrices [N_A, top_k_out] ---
+    # We use Pandas here because after merging, some 'x' might have 5 candidates, others 15.
+    # Pandas makes it extremely easy to group, sort, and slice jagged arrays.
+    df = pd.DataFrame({'x': x_uniq, 'y': y_uniq, 'score': csls_scores})
+
+    # Sort by 'x' (ascending) and then by 'score' (descending)
+    df_sorted = df.sort_values(by=['x', 'score'], ascending=[True, False])
+
+    # Keep only the absolute best 'top_k_out' candidates per source document
+    top_k_df = df_sorted.groupby('x').head(top_k_out)
+
+    # Initialize empty output matrices (-1e9 for safe sorting later, -1 for missing IDs)
+    D_out = np.full((N_A, top_k_out), -1e9, dtype=np.float32)
+    I_out = np.full((N_A, top_k_out), -1, dtype=np.int64)
+
+    # Fill the top results back into the matrices
+    for x_val, group in top_k_df.groupby('x'):
+        n_cands = len(group)
+        D_out[x_val, :n_cands] = group['score'].values
+        I_out[x_val, :n_cands] = group['y'].values
+    return D_out, I_out
