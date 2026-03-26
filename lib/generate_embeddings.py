@@ -6,8 +6,8 @@ import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
 
-from .utils import AlignerIO, cuda_available
-from .doc_split import sent_split_tkn, chunk_split
+from utils import AlignerIO, cuda_available
+from doc_split import sent_split_tkn, chunk_split
 
 
 Doc = Union[str, Path]
