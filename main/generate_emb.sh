@@ -2,8 +2,7 @@
 
 # --- CONFIGURATION ---
 # Lang
-SRC_LANG="vi"
-TAR_LANG="zh"
+LANG="vi"
 
 # Model
 MODEL_PATH="sentence-transformers/LaBSE"
