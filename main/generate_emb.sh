@@ -34,7 +34,7 @@ echo "Lang:  $LANG"
 echo "====================================================="
 
 echo -e "\n Processing For Language: $LANG..."
-python ../lib/generate_embeddings.py \
+python ../lib/aligner/generate_embeddings.py \
     --input_dir "$INPUT_BASE_DIR" \
     --output_dir "$OUTPUT_BASE_DIR" \
     --lang "$LANG" \

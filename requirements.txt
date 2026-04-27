@@ -6,3 +6,6 @@ numpy
 torch
 seaborn
 matplotlib
+langchain_text_splitters
+google-generativeai
+python-dotenv

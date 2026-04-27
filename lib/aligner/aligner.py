@@ -4,9 +4,9 @@ import numpy as np
 from typing import List, Tuple
 from pathlib import Path
 
-from utils import get_filename_only, AlignerIO, cuda_available
-from retrieval import build_retrieval_matrix, rerank_bimax, compute_csls
-from eval import eval, plot_confusion_matrix
+from lib.utils import get_filename_only, AlignerIO, cuda_available
+from lib.aligner.retrieval import build_retrieval_matrix, rerank_bimax, compute_csls
+from lib.aligner.eval import eval, plot_confusion_matrix
 
 def extract_edges_from_faiss(D: np.ndarray, I: np.ndarray, threshold: float = 0.75) -> List[Tuple[int, int, float]]:
     """

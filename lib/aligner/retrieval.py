@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import faiss
 
-from utils import AlignerIO
+from lib.utils import AlignerIO
 
 
 ScoreMode = Literal["csls", "margin1", "cosine"]

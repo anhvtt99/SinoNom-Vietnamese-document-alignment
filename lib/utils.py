@@ -133,3 +133,17 @@ def get_torch_device(prefer_cuda: bool = True) -> torch.device:
 def get_filename_only(path_str: str) -> str:
     """Returns 'document.txt' from '/path/to/data/document.txt'"""
     return os.path.basename(path_str)
+
+# -----------------------
+# Helpers: function for normalization vietnamese word
+# -----------------------
+def normalize_vietnamese_phrase(text: str) -> str:
+    """
+    Normalize keyword text for stable comparison.
+    Notes:
+        - lowercased
+        - underscores converted to spaces
+        - repeated spaces collapsed
+    """
+    text = text.lower().replace("_", " ")
+    return " ".join(text.split())

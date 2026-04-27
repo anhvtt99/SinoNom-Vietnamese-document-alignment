@@ -36,7 +36,7 @@ RESULTS_DIR="../results"
 
 # --- EXECUTION ---
 echo -e "\n Processing For Source Language: $SRC_LANG..."
-python ../lib/generate_embeddings.py \
+python ../lib/aligner/generate_embeddings.py \
     --input_dir "$INPUT_BASE_DIR/$SRC_LANG" \
     --output_dir "$EMB_BASE_PATH" \
     --lang "$SRC_LANG" \
@@ -49,7 +49,7 @@ python ../lib/generate_embeddings.py \
     --overlap_rate $OVERLAP_RATE
 
 echo -e "\n Processing For Target Language: $TAR_LANG..."
-python ../lib/generate_embeddings.py \
+python ../lib/aligner/generate_embeddings.py \
     --input_dir "$INPUT_BASE_DIR/$TAR_LANG" \
     --output_dir "$EMB_BASE_PATH" \
     --lang "$TAR_LANG" \
@@ -62,7 +62,7 @@ python ../lib/generate_embeddings.py \
     --overlap_rate $OVERLAP_RATE
 
 echo -e "\n Starting Document Alignment Pipeline..."
-python ../lib/aligner.py \
+python ../lib/aligner/aligner.py \
     --emb_base_path "$EMB_BASE_PATH" \
     --src_lang "$SRC_LANG" \
     --tar_lang "$TAR_LANG" \
