@@ -17,16 +17,20 @@ import random
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from functools import partial
 
 from lib.web.VnKeywordExtractor import VnKeywordExtractor
-from lib.web.wikisource_reranker import score_anchor_candidates, get_wikisource_stats, WikisourceRateLimitError
-from lib.translators.base import create_translator
-from lib.config import load_project_env, get_env, require_env
+from lib.web.wikisource_reranker import (
+    score_anchor_candidates,
+    get_wikisource_stats,
+    get_wikisource_auth_status,
+    init_wikisource_session,
+    WikisourceRateLimitError,
+)
+from lib.translators import create_translator
+from lib.config import load_project_env, get_env
 
-REQUEST_SLEEP_RANGE = (1.0, 2.0)
-GROUP_SLEEP_RANGE = (30.0, 45.0)
-
+REQUEST_SLEEP_RANGE = (0.25, 0.50)
+GROUP_SLEEP_RANGE = (2.0, 5.0)
 
 def random_sleep_seconds(seconds_range: tuple[float, float]) -> float:
     lo, hi = seconds_range
@@ -278,8 +282,6 @@ def build_queries_for_keyword_file(
         empty_terms = [term for term, trans in translated_all.items() if trans == ""]
 
         print(f"Translation hits in groups: {total_hit}/{total_kw}")
-        if empty_terms:
-            print(f"Cached empty translations: {len(empty_terms)}")
 
     # =========================================================================
     # 4. ANCHOR SELECTION + QUERY BUILD
@@ -402,6 +404,7 @@ def build_queries_for_keyword_file(
         "wikisource_rerank_scope": args.wikisource_rerank_scope,
         "wikisource_rerank_top_k": args.wikisource_rerank_top_k,
         "wikisource_disabled": runtime_state.get("wikisource_disabled", False),
+        "wikisource_auth": get_wikisource_auth_status() if args.use_wikisource_rerank else None,
         "use_site_restriction": args.use_site_restriction,
         "results": results,
     }
@@ -548,34 +551,16 @@ def main():
     if args.input_dir and not args.output_dir:
         raise ValueError("--output_dir is required when using --input_dir")
 
-    translate_fn = None
-    if args.translate_gemini:
-        from lib.translators.gemini import (
-            create_gemini_model,
-            translate_vi_to_han_with_gemini,
-        )
-
-        gemini_model = create_gemini_model(
-            api_key=require_env("GEMINI_API_KEY"),
-            model_name=args.gemini_model_name,
-        )
-        if args.src_lang == "vi" and args.tgt_lang == "zh":
-            translate_fn = partial(
-                translate_vi_to_han_with_gemini,
-                gemini_model,
-                verbose=args.verbose,
-            )
-        else:
-            raise NotImplementedError(
-                f"Gemini translation is not implemented for {args.src_lang}->{args.tgt_lang}"
-            )
+    translation_backend = "gemini" if args.translate_gemini else "cache"
 
     translator = create_translator(
         src_lang=args.src_lang,
         tgt_lang=args.tgt_lang,
-        translate_fn=translate_fn,
+        backend=translation_backend,
         cache_dir=args.translation_cache_dir,
         batch_size=args.translation_batch_size,
+        verbose=args.verbose,
+        gemini_model_name=args.gemini_model_name,
     )
 
     allowed_pos = set(args.allowed_pos) if args.allowed_pos else None
@@ -584,6 +569,13 @@ def main():
     runtime_state = {
         "wikisource_disabled": False,
     }
+
+    if args.use_wikisource_rerank:
+        init_wikisource_session(verbose=args.verbose)
+        if args.verbose:
+            auth_status = get_wikisource_auth_status()
+            mode = "bot" if auth_status["logged_in"] else "anonymous"
+            print(f"[Wikisource auth] mode={mode}, user={auth_status['username']}")
     if args.keyword_path:
         build_queries_for_keyword_file(
             keyword_path=Path(args.keyword_path),

@@ -66,22 +66,21 @@ def translate_vi_to_han_with_gemini(
     """
     Translate Vietnamese Quốc Ngữ terms to historical Han / Traditional Chinese.
 
-    Signature compatible with BatchTranslator:
+    Signature compatible with BatchTranslator after binding model:
         List[str] -> Dict[str, str]
     """
     if not terms:
         return {}
 
-    clean_terms = []
+    clean_terms: List[str] = []
     seen = set()
 
     for term in terms:
         term = str(term).strip()
-        if not term:
+        if not term or term in seen:
             continue
-        if term not in seen:
-            seen.add(term)
-            clean_terms.append(term)
+        seen.add(term)
+        clean_terms.append(term)
 
     if not clean_terms:
         return {}
@@ -99,17 +98,15 @@ def translate_vi_to_han_with_gemini(
 
         raw_result = json.loads(response.text)
 
-        result = {}
+        result: Dict[str, str] = {}
         for term in clean_terms:
             value = raw_result.get(term, "")
             result[term] = str(value).strip() if value else ""
 
         if verbose:
-            hit = sum(1 for v in result.values() if v)
-            missing = [k for k, v in result.items() if not v]
-
+            hit = sum(1 for value in result.values() if value)
+            missing = [key for key, value in result.items() if not value]
             print(f"Gemini translated {hit}/{len(clean_terms)} terms")
-
             if missing:
                 print(f"Empty translations: {missing}")
 
@@ -120,7 +117,37 @@ def translate_vi_to_han_with_gemini(
             print(f"Gemini did not return valid JSON for terms: {clean_terms}")
         return {}
 
-    except Exception as e:
+    except Exception as exc:
         if verbose:
-            print(f"Gemini translation API error: {e}")
+            print(f"Gemini translation API error: {exc}")
         return {}
+
+
+def create_gemini_translate_fn(
+    api_key: str,
+    model_name: str = "models/gemini-2.5-pro",
+    src_lang: str = "vi",
+    tgt_lang: str = "zh",
+    verbose: bool = False,
+):
+    """
+    Create a translate_fn compatible with BatchTranslator.
+
+    Returns:
+        Callable[[List[str]], Dict[str, str]]
+    """
+    if not (src_lang == "vi" and tgt_lang == "zh"):
+        raise NotImplementedError(
+            f"Gemini translation is not implemented for {src_lang}->{tgt_lang}"
+        )
+
+    model = create_gemini_model(api_key=api_key, model_name=model_name)
+
+    def translate_fn(terms: List[str]) -> Dict[str, str]:
+        return translate_vi_to_han_with_gemini(
+            model=model,
+            terms=terms,
+            verbose=verbose,
+        )
+
+    return translate_fn

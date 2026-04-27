@@ -6,9 +6,10 @@ Purpose:
 - reward keywords that co-occur with other translated candidates,
 - penalize keywords that are too isolated or too generic.
 
-This module is designed for retrieval-oriented anchor selection:
-we care more about searchability and translation plausibility
-than pure semantic relevance.
+Auth design:
+- use normal env variables or .env via lib.config,
+- if WIKISOURCE_BOT_USERNAME and WIKISOURCE_BOT_PASSWORD exist, login once,
+- otherwise fallback to anonymous requests.
 """
 
 import time
@@ -16,15 +17,123 @@ import requests
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple, Any, Set
 
+from lib.config import load_project_env, get_env
 
-WIKISOURCE_API = "https://zh.wikisource.org/w/api.php"
+
+DEFAULT_WIKISOURCE_API = "https://zh.wikisource.org/w/api.php"
+DEFAULT_USER_AGENT = "MyThesisBot/1.0 (research use)"
+
+WIKISOURCE_API = DEFAULT_WIKISOURCE_API
 HEADERS = {
-    "User-Agent": "MyThesisBot/1.0 (research use)"
+    "User-Agent": DEFAULT_USER_AGENT,
 }
+
+# One global session is enough. If bot credentials exist, it becomes logged-in.
+WIKISOURCE_SESSION = requests.Session()
+WIKISOURCE_AUTH_INITIALIZED = False
+WIKISOURCE_LOGGED_IN = False
+WIKISOURCE_USERNAME: Optional[str] = None
 
 WIKISOURCE_REQUEST_COUNT = 0
 WIKISOURCE_CACHE_HIT_COUNT = 0
 WIKISOURCE_429_COUNT = 0
+
+
+def init_wikisource_session(verbose: bool = False, timeout: int = 10) -> bool:
+    """
+    Initialize Wikisource HTTP session.
+
+    Env variables loaded from shell or .env through lib.config:
+        WIKISOURCE_API
+        WIKISOURCE_USER_AGENT
+        WIKISOURCE_BOT_USERNAME
+        WIKISOURCE_BOT_PASSWORD
+
+    Returns:
+        True if logged in with bot credentials, False if anonymous.
+    """
+    global WIKISOURCE_API, WIKISOURCE_AUTH_INITIALIZED
+    global WIKISOURCE_LOGGED_IN, WIKISOURCE_USERNAME
+
+    if WIKISOURCE_AUTH_INITIALIZED:
+        return WIKISOURCE_LOGGED_IN
+
+    load_project_env()
+
+    WIKISOURCE_API = get_env("WIKISOURCE_API", DEFAULT_WIKISOURCE_API) or DEFAULT_WIKISOURCE_API
+    user_agent = get_env("WIKISOURCE_USER_AGENT", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT
+
+    HEADERS["User-Agent"] = user_agent
+    WIKISOURCE_SESSION.headers.update(HEADERS)
+
+    username = get_env("WIKISOURCE_BOT_USERNAME")
+    password = get_env("WIKISOURCE_BOT_PASSWORD")
+
+    WIKISOURCE_AUTH_INITIALIZED = True
+
+    if not username or not password:
+        if verbose:
+            print("[Wikisource auth] no bot credentials found; using anonymous session")
+        return False
+
+    try:
+        # 1) Get login token.
+        token_resp = WIKISOURCE_SESSION.get(
+            WIKISOURCE_API,
+            params={
+                "action": "query",
+                "meta": "tokens",
+                "type": "login",
+                "format": "json",
+            },
+            timeout=timeout,
+        )
+        token_resp.raise_for_status()
+        login_token = token_resp.json()["query"]["tokens"]["logintoken"]
+
+        # 2) Login with BotPassword.
+        login_resp = WIKISOURCE_SESSION.post(
+            WIKISOURCE_API,
+            data={
+                "action": "login",
+                "lgname": username,
+                "lgpassword": password,
+                "lgtoken": login_token,
+                "format": "json",
+            },
+            timeout=timeout,
+        )
+        login_resp.raise_for_status()
+        login_data = login_resp.json().get("login", {})
+
+        if login_data.get("result") == "Success":
+            WIKISOURCE_LOGGED_IN = True
+            WIKISOURCE_USERNAME = username
+            if verbose:
+                print(f"[Wikisource auth] logged in as {username}")
+        else:
+            WIKISOURCE_LOGGED_IN = False
+            WIKISOURCE_USERNAME = None
+            if verbose:
+                reason = login_data.get("reason") or login_data.get("result")
+                print(f"[Wikisource auth] login failed: {reason}; using anonymous session")
+
+    except Exception as e:
+        WIKISOURCE_LOGGED_IN = False
+        WIKISOURCE_USERNAME = None
+        if verbose:
+            print(f"[Wikisource auth] login error: {e}; using anonymous session")
+
+    return WIKISOURCE_LOGGED_IN
+
+
+def get_wikisource_auth_status() -> Dict[str, Any]:
+    return {
+        "logged_in": WIKISOURCE_LOGGED_IN,
+        "username": WIKISOURCE_USERNAME,
+        "api": WIKISOURCE_API,
+        "user_agent": HEADERS.get("User-Agent"),
+    }
 
 
 def get_wikisource_stats() -> Dict[str, int]:
@@ -41,8 +150,10 @@ def reset_wikisource_stats():
     WIKISOURCE_CACHE_HIT_COUNT = 0
     WIKISOURCE_429_COUNT = 0
 
+
 class WikisourceRateLimitError(RuntimeError):
     pass
+
 
 def pair_hit_quality(hits: int) -> float:
     """
@@ -69,6 +180,7 @@ def pair_hit_quality(hits: int) -> float:
     else:
         return 0.1
 
+
 def search_pair_hits_wikisource(
     word1: str,
     word2: str,
@@ -87,6 +199,9 @@ def search_pair_hits_wikisource(
         - Count actual HTTP requests, excluding cache hits.
     """
     global WIKISOURCE_REQUEST_COUNT, WIKISOURCE_CACHE_HIT_COUNT, WIKISOURCE_429_COUNT
+
+    # Login once if bot env exists; otherwise this stays anonymous.
+    init_wikisource_session(verbose=False, timeout=timeout)
 
     key = tuple(sorted([word1, word2]))
 
@@ -108,10 +223,9 @@ def search_pair_hits_wikisource(
         WIKISOURCE_REQUEST_COUNT += 1
         request_no = WIKISOURCE_REQUEST_COUNT
 
-        resp = requests.get(
+        resp = WIKISOURCE_SESSION.get(
             WIKISOURCE_API,
             params=params,
-            headers=HEADERS,
             timeout=timeout,
         )
 
@@ -281,13 +395,7 @@ def score_anchor_candidates(
         cache: Dict[Tuple[str, str], int] = {}
 
         for cand in rerank_candidates:
-            cand["rerank_source"] = "wikisource"
-
-        # Optional debug
-        # print(
-        #     f"[Wikisource rerank] candidates={len(rerank_candidates)}, "
-        #     f"pairs={len(rerank_candidates) * (len(rerank_candidates) - 1) // 2}"
-        # )
+            cand["rerank_source"] = "wikisource_bot" if WIKISOURCE_LOGGED_IN else "wikisource"
 
         for cand_a, cand_b in combinations(rerank_candidates, 2):
             han_a = cand_a["han_word"]
@@ -350,6 +458,7 @@ def score_anchor_candidates(
     )
 
     return ranked_candidates, pair_matrix
+
 
 def select_top_anchors(
     keywords: List[Dict[str, Any]],
