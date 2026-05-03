@@ -187,13 +187,17 @@ class BatchTranslator:
 # FACTORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def create_translator(
+def create_cache_translator(
     src_lang: str,
     tgt_lang: str,
     translate_fn: Optional[TranslateFn] = None,
     cache_dir: str = "cache/",
     batch_size: int = 20,
 ) -> BatchTranslator:
-    """Create translator with cache."""
+    """Create a cache-backed batch translator."""
     cache = TranslationCache(src_lang, tgt_lang, cache_dir)
-    return BatchTranslator(cache, translate_fn, batch_size)
+    return BatchTranslator(
+        cache=cache,
+        translate_fn=translate_fn,
+        batch_size=batch_size,
+    )

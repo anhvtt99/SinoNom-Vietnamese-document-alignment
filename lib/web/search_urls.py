@@ -13,26 +13,25 @@ Required env:
 
 import argparse
 import json
-import random
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+from collections import Counter
 
+from lib.utils import random_sleep_seconds
 from lib.config import load_project_env
 from lib.web.searchers import create_search_client
 
 
-def random_sleep(base_sec: float, jitter_sec: float = 0.0) -> None:
-    if base_sec <= 0 and jitter_sec <= 0:
-        return
+def normalize_url_for_early_stop(url: str) -> str:
+    url = str(url).strip()
+    if not url:
+        return ""
 
-    delay = base_sec
-    if jitter_sec > 0:
-        delay += random.uniform(0, jitter_sec)
+    url = url.split("#", 1)[0]
+    url = url.rstrip("/")
 
-    if delay > 0:
-        time.sleep(delay)
-
+    return url
 
 def load_query_file(query_path: Path) -> Dict[str, Any]:
     with query_path.open("r", encoding="utf-8") as f:
@@ -101,12 +100,20 @@ def search_one_query_file(
 
     doc_id = data.get("doc_id", query_path.stem)
     query_items = extract_query_items(data)
+
     if args.top_queries is not None:
         query_items = query_items[:args.top_queries]
+
     search_kwargs = build_search_kwargs(args)
 
-    urls: List[Dict[str, Any]] = []
+    query_results: List[Dict[str, Any]] = []
     query_errors: List[Dict[str, Any]] = []
+    num_raw_urls = 0
+
+    url_seen_counts = Counter()
+    early_stopped = False
+    early_stop_reason = None
+    early_stop_url = None
 
     if args.verbose:
         print(f"\n=== Searching URLs for {doc_id} ===")
@@ -117,16 +124,21 @@ def search_one_query_file(
     for idx, item in enumerate(query_items, start=1):
         query_id = item["query_id"]
         query = item["query"]
-        if args.verbose:
-            print(f"\n[{idx}/{len(query_items)}] {doc_id}/{query_id}")
-            print(query)
-
         rerank_source = item.get("rerank_source", "")
+
         is_weak_query = not str(rerank_source).startswith("wikisource")
+
         num_results = args.num_results
         if is_weak_query and args.fallback_num_results is not None:
             num_results = args.fallback_num_results
-                
+
+        if args.verbose:
+            print(f"\n[{idx}/{len(query_items)}] {doc_id}/{query_id}")
+            print(query)
+            print(f"rerank_source={rerank_source}, requested_num_results={num_results}")
+
+        urls: List[Dict[str, Any]] = []
+
         try:
             results = search_client.search(
                 query=query,
@@ -134,43 +146,86 @@ def search_one_query_file(
                 **search_kwargs,
             )
 
+            for result in results:
+                url = str(result.get("url", "")).strip()
+                if not url:
+                    continue
+
+                urls.append({
+                    "source_block": result.get("source_block", ""),
+                    "rank": result.get("rank"),
+                    "title": result.get("title", ""),
+                    "url": url,
+                    "snippet": result.get("snippet", ""),
+                })
+
+            query_results.append({
+                "query_id": query_id,
+                "query": query,
+                "rerank_source": rerank_source,
+                "requested_num_results": num_results,
+                "num_urls": len(urls),
+                "urls": urls,
+            })
+
+            num_raw_urls += len(urls)
+
+            if args.verbose:
+                print(f"Results: {len(urls)}")
+
+            # -------------------------
+            # Early stopping by URL frequency
+            # -------------------------
+            if args.early_stop_url_count is not None:
+                for u in urls:
+                    norm_url = normalize_url_for_early_stop(u.get("url", ""))
+                    if not norm_url:
+                        continue
+
+                    url_seen_counts[norm_url] += 1
+
+                    if url_seen_counts[norm_url] >= args.early_stop_url_count:
+                        early_stopped = True
+                        early_stop_url = norm_url
+                        early_stop_reason = (
+                            f"Stopped after {idx} queries because URL appeared "
+                            f"{url_seen_counts[norm_url]} times: {norm_url}"
+                        )
+                        break
+
+                if args.verbose and early_stop_url:
+                    print(f"[Early stop] {early_stop_reason}")
+
+                if early_stopped:
+                    break
+
         except Exception as e:
             error_msg = str(e)
+
             query_errors.append({
                 "query_id": query_id,
                 "query": query,
+                "rerank_source": rerank_source,
+                "requested_num_results": num_results,
+                "error": error_msg,
+            })
+
+            query_results.append({
+                "query_id": query_id,
+                "query": query,
+                "rerank_source": rerank_source,
+                "requested_num_results": num_results,
+                "num_urls": 0,
+                "urls": [],
+                "status": "error",
                 "error": error_msg,
             })
 
             if args.verbose:
                 print(f"[Search error] {doc_id}/{query_id}: {error_msg}")
 
-            results = []
-
-        for result in results:
-            url = str(result.get("url", "")).strip()
-            if not url:
-                continue
-
-            urls.append({
-                "doc_id": doc_id,
-                "query_id": query_id,
-                "query": query,
-                "rerank_source": item.get("rerank_source", ""),
-                "requested_num_results": num_results,
-                "source_block": result.get("source_block", ""),
-                "rank": result.get("rank"),
-                "title": result.get("title", ""),
-                "url": url,
-                "snippet": result.get("snippet", ""),
-                "raw": result.get("raw", {}),
-            })
-
-        if args.verbose:
-            print(f"Results: {len(results)}")
-
         if idx < len(query_items):
-            random_sleep(args.sleep_sec, args.sleep_jitter)
+            time.sleep(random_sleep_seconds(tuple(args.sleep_range)))
 
     output = {
         "doc_id": doc_id,
@@ -178,16 +233,24 @@ def search_one_query_file(
         "search_backend": args.search_backend,
         "search_params": {
             "num_results": args.num_results,
+            "fallback_num_results": args.fallback_num_results,
+            "top_queries": args.top_queries,
             "gl": args.gl,
             "hl": args.hl,
             "location": args.location,
             "include_omitted": args.include_omitted,
             "filter": 0 if args.include_omitted else None,
         },
+        "early_stopped": early_stopped,
+        "early_stop_reason": early_stop_reason,
+        "early_stop_url": early_stop_url,
+        "early_stop_config": {
+            "early_stop_url_count": args.early_stop_url_count,
+        },
         "num_queries": len(query_items),
-        "num_raw_urls": len(urls),
+        "num_raw_urls": num_raw_urls,
         "num_query_errors": len(query_errors),
-        "urls": urls,
+        "query_results": query_results,
         "query_errors": query_errors,
     }
 
@@ -196,7 +259,7 @@ def search_one_query_file(
 
     if args.verbose:
         print(f"\nSaved URL file to: {output_path}")
-        print(f"Raw URLs: {len(urls)}")
+        print(f"Raw URLs: {num_raw_urls}")
         print(f"Query errors: {len(query_errors)}")
 
 
@@ -276,17 +339,22 @@ def main():
     )
 
     parser.add_argument(
-        "--sleep_sec",
+        "--sleep_range",
         type=float,
-        default=1.0,
-        help="Base sleep between queries",
+        nargs=2,
+        default=(1.0, 1.5),
+        metavar=("MIN", "MAX"),
+        help="Random sleep range between search requests",
     )
 
     parser.add_argument(
-        "--sleep_jitter",
-        type=float,
-        default=0.5,
-        help="Random extra sleep between queries",
+        "--early_stop_url_count",
+        type=int,
+        default=None,
+        help=(
+            "Stop searching a document when any normalized URL appears this many times "
+            "across searched queries. If None, disabled."
+        ),
     )
 
     parser.add_argument("--verbose", action="store_true")

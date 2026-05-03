@@ -9,3 +9,9 @@ matplotlib
 langchain_text_splitters
 google-generativeai
 python-dotenv
+requests
+trafilatura
+beautifulsoup4
+lxml
+pymupdf
+opencc-python-reimplemented

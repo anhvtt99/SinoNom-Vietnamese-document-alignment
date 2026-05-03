@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from lib.utils import random_sleep_seconds
 from lib.web.VnKeywordExtractor import VnKeywordExtractor
 from lib.web.wikisource_reranker import (
     score_anchor_candidates,
@@ -30,13 +31,56 @@ from lib.translators import create_translator
 from lib.config import load_project_env, get_env
 
 REQUEST_SLEEP_RANGE = (0.25, 0.50)
-GROUP_SLEEP_RANGE = (2.0, 5.0)
+GROUP_SLEEP_RANGE = (1.0, 1.5)
 
-def random_sleep_seconds(seconds_range: tuple[float, float]) -> float:
-    lo, hi = seconds_range
-    if hi <= 0:
-        return 0.0
-    return random.uniform(lo, hi)
+
+def has_wikisource_support(item: Dict[str, Any]) -> bool:
+    return (
+        str(item.get("rerank_source", "")).startswith("wikisource")
+        and int(item.get("support_count", 0) or 0) > 0
+    )
+
+
+def select_query_terms(
+    ranked_candidates: List[Dict[str, Any]],
+    num_query_terms: int,
+    allow_semantic_fallback: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Select final query terms after Wikisource reranking.
+
+    Policy:
+    - If Wikisource-supported terms exist, use only supported terms by default.
+    - If allow_semantic_fallback=True, fill remaining slots with unsupported terms.
+    - If no Wikisource-supported term exists, fallback to ranked candidates.
+    """
+    supported = [
+        x for x in ranked_candidates
+        if has_wikisource_support(x)
+    ]
+
+    if supported:
+        if not allow_semantic_fallback:
+            return supported[:num_query_terms]
+
+        selected = supported[:num_query_terms]
+
+        if len(selected) < num_query_terms:
+            selected_keys = {
+                (str(x.get("word", "")), str(x.get("han_word", "")))
+                for x in selected
+            }
+
+            fallback = [
+                x for x in ranked_candidates
+                if (str(x.get("word", "")), str(x.get("han_word", ""))) not in selected_keys
+            ]
+
+            selected.extend(fallback[: num_query_terms - len(selected)])
+
+        return selected
+
+    return ranked_candidates[:num_query_terms]
 
 
 def split_exact_and_loose_terms(
@@ -44,20 +88,42 @@ def split_exact_and_loose_terms(
     num_exact_anchors: int = 3,
     preferred_exact_pos: Optional[set[str]] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Split selected query terms into exact quoted anchors and loose terms.
+
+    If Wikisource support metadata is available, exact anchors prefer
+    supported terms. This prevents unsupported fallback terms from being quoted.
+    """
     preferred_exact_pos = preferred_exact_pos or {"Np"}
 
-    preferred = []
+    supported_preferred = []
+    supported_other = []
     fallback = []
+
+    any_support_metadata = any(
+        "support_count" in item or str(item.get("rerank_source", "")).startswith("wikisource")
+        for item in query_terms
+    )
 
     for item in query_terms:
         pos_tags = set(str(item.get("pos", "")).split())
+        is_supported = has_wikisource_support(item)
 
-        if pos_tags & preferred_exact_pos:
-            preferred.append(item)
+        if any_support_metadata:
+            if is_supported and (pos_tags & preferred_exact_pos):
+                supported_preferred.append(item)
+            elif is_supported:
+                supported_other.append(item)
+            else:
+                fallback.append(item)
         else:
-            fallback.append(item)
+            # Semantic-only mode: preserve old behavior.
+            if pos_tags & preferred_exact_pos:
+                supported_preferred.append(item)
+            else:
+                fallback.append(item)
 
-    exact = (preferred + fallback)[:num_exact_anchors]
+    exact = (supported_preferred + supported_other + fallback)[:num_exact_anchors]
 
     exact_keys = {
         (str(x.get("word", "")), str(x.get("han_word", "")))
@@ -372,7 +438,15 @@ def build_queries_for_keyword_file(
                 item["rerank_source"] = "semantic"
 
         # Final query build: always run, no matter where ranked_candidates came from.
-        query_terms = ranked_candidates[:args.num_query_terms]
+        if should_use_wikisource and item.get("rerank_source") == "wikisource":
+            query_terms = select_query_terms(
+                ranked_candidates=ranked_candidates,
+                num_query_terms=args.num_query_terms,
+                allow_semantic_fallback=args.allow_semantic_fallback_terms,
+            )
+        else:
+            query_terms = ranked_candidates[:args.num_query_terms]
+
         item["query_terms"] = query_terms
 
         item["query"] = build_mixed_query(
@@ -403,6 +477,7 @@ def build_queries_for_keyword_file(
         "use_wikisource_rerank": args.use_wikisource_rerank,
         "wikisource_rerank_scope": args.wikisource_rerank_scope,
         "wikisource_rerank_top_k": args.wikisource_rerank_top_k,
+        "allow_semantic_fallback_terms": args.allow_semantic_fallback_terms,
         "wikisource_disabled": runtime_state.get("wikisource_disabled", False),
         "wikisource_auth": get_wikisource_auth_status() if args.use_wikisource_rerank else None,
         "use_site_restriction": args.use_site_restriction,
@@ -474,7 +549,7 @@ def main():
     parser.add_argument(
         "--preferred_exact_pos",
         nargs="*",
-        default=["Np"],
+        default=["Np", "N"],
         help="POS tags preferred for exact quoted anchors in the final query",
     )
 
@@ -512,10 +587,11 @@ def main():
         default=8,
         help="Only the top K eligible translated keywords are sent to Wikisource reranking",
     )
+
     parser.add_argument(
         "--allowed_pos",
         nargs="*",
-        default=["Np"],
+        default=["Np", "N"],
         help="POS tags used only when --use_wikisource_rerank is enabled",
     )
     parser.add_argument(
@@ -525,7 +601,14 @@ def main():
         choices=["global", "all"],
         help="Which query groups use Wikisource reranking",
     )
-
+    parser.add_argument(
+        "--allow_semantic_fallback_terms",
+        action="store_true",
+        help=(
+            "When Wikisource rerank is used and supported terms exist, "
+            "allow unsupported semantic terms to fill remaining query slots."
+        ),
+    )
     parser.add_argument(
         "--use_site_restriction",
         action="store_true",
