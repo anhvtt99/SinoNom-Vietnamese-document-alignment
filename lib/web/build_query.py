@@ -30,8 +30,8 @@ from lib.web.wikisource_reranker import (
 from lib.translators import create_translator
 from lib.config import load_project_env, get_env
 
-REQUEST_SLEEP_RANGE = (0.25, 0.50)
-GROUP_SLEEP_RANGE = (1.0, 1.5)
+REQUEST_SLEEP_RANGE = (0.25, 0.35)
+GROUP_SLEEP_RANGE = (0.5, 1.0)
 
 
 def has_wikisource_support(item: Dict[str, Any]) -> bool:
@@ -142,6 +142,7 @@ def build_mixed_query(
     num_exact_anchors: int = 3,
     sites: Optional[List[str]] = None,
     preferred_exact_pos: Optional[set[str]] = None,
+    anchor_only: bool = False,
 ) -> str:
     exact_items, loose_items = split_exact_and_loose_terms(
         query_terms=query_terms,
@@ -156,10 +157,11 @@ def build_mixed_query(
         if term:
             parts.append(f'"{term}"')
 
-    for item in loose_items:
-        term = str(item.get("han_word", "") or item.get("trans", "")).strip()
-        if term:
-            parts.append(term)
+    if not anchor_only:
+        for item in loose_items:
+            term = str(item.get("han_word", "") or item.get("trans", "")).strip()
+            if term:
+                parts.append(term)
 
     if sites:
         if len(sites) == 1:
@@ -449,11 +451,43 @@ def build_queries_for_keyword_file(
 
         item["query_terms"] = query_terms
 
+        exact_items, loose_items = split_exact_and_loose_terms(
+            query_terms=query_terms,
+            num_exact_anchors=args.num_exact_anchors,
+            preferred_exact_pos=preferred_exact_pos,
+        )
+
+        item["exact_terms"] = exact_items
+        item["loose_terms"] = [] if args.anchor_only else loose_items
+        item["dropped_loose_terms"] = loose_items if args.anchor_only else []
+        item["query_plan"] = {
+            "mode": "anchor_only" if args.anchor_only else "mixed",
+            "anchor_only": args.anchor_only,
+            "num_exact_anchors": args.num_exact_anchors,
+            "num_query_terms": args.num_query_terms,
+            "exact_han_terms": [
+                str(x.get("han_word", "") or x.get("trans", "")).strip()
+                for x in exact_items
+                if str(x.get("han_word", "") or x.get("trans", "")).strip()
+            ],
+            "loose_han_terms": [] if args.anchor_only else [
+                str(x.get("han_word", "") or x.get("trans", "")).strip()
+                for x in loose_items
+                if str(x.get("han_word", "") or x.get("trans", "")).strip()
+            ],
+            "dropped_loose_han_terms": [
+                str(x.get("han_word", "") or x.get("trans", "")).strip()
+                for x in loose_items
+                if args.anchor_only and str(x.get("han_word", "") or x.get("trans", "")).strip()
+            ],
+        }
+
         item["query"] = build_mixed_query(
             query_terms=query_terms,
             num_exact_anchors=args.num_exact_anchors,
             sites=sites,
             preferred_exact_pos=preferred_exact_pos,
+            anchor_only=args.anchor_only,
         )
 
         if args.verbose:
@@ -478,6 +512,7 @@ def build_queries_for_keyword_file(
         "wikisource_rerank_scope": args.wikisource_rerank_scope,
         "wikisource_rerank_top_k": args.wikisource_rerank_top_k,
         "allow_semantic_fallback_terms": args.allow_semantic_fallback_terms,
+        "anchor_only": args.anchor_only,
         "wikisource_disabled": runtime_state.get("wikisource_disabled", False),
         "wikisource_auth": get_wikisource_auth_status() if args.use_wikisource_rerank else None,
         "use_site_restriction": args.use_site_restriction,
@@ -544,6 +579,11 @@ def main():
         type=int,
         default=3,
         help="Number of top query terms quoted as exact anchors",
+    )
+    parser.add_argument(
+        "--anchor_only",
+        action="store_true",
+        help="Build queries using only exact quoted anchors; omit all loose terms.",
     )
 
     parser.add_argument(

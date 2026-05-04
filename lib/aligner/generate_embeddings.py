@@ -26,8 +26,11 @@ def st_encode_features(
     features:
       - input_ids: LongTensor [N, L]
       - attention_mask: LongTensor [N, L]
-      - (optional) token_type_ids: LongTensor [N, L]
-    return: np.ndarray [N, D] float32 (or torch.Tensor if convert_to_numpy=False)
+      - optional token_type_ids: LongTensor [N, L]
+
+    return:
+      np.ndarray [N, D] float32 if convert_to_numpy=True
+      torch.Tensor [N, D] float32 if convert_to_numpy=False
     """
     input_ids = features["input_ids"]
     N = int(input_ids.shape[0])
@@ -42,14 +45,28 @@ def st_encode_features(
 
     with torch.inference_mode():
         for start in range(0, N, batch_size):
-            batch = {k: v[start:start+batch_size].to(device) for k, v in features.items()}
+            batch = {
+                k: v[start:start + batch_size].to(device, non_blocking=True)
+                for k, v in features.items()
+            }
+
             out = model(batch)["sentence_embedding"]  # [b, D]
+
             if normalize_embeddings:
                 out = torch.nn.functional.normalize(out, p=2, dim=1)
-            outs.append(out.detach().cpu())
 
+            # Keep outputs on GPU; copy to CPU only once after all mini-batches.
+            outs.append(out.detach())
+
+    # Concat on GPU.
     emb = torch.cat(outs, dim=0).to(torch.float32)
-    return emb.numpy() if convert_to_numpy else emb
+
+    if convert_to_numpy:
+        # One GPU -> CPU copy per encode group.
+        emb = emb.cpu()
+        return emb.numpy()
+
+    return emb
 
 def concat_feature_batches(
     features_list: Sequence[Dict[str, torch.Tensor]],

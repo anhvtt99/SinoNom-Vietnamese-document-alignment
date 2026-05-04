@@ -54,6 +54,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
+try:
+    from opencc import OpenCC
+except ImportError:
+    OpenCC = None
+
+
 # =============================================================================
 # Regex patterns
 # =============================================================================
@@ -65,10 +71,24 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 # - Compatibility Ideographs: U+F900–U+FAFF
 HAN_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\U00020000-\U0002A6DF\uF900-\uFAFF]")
 
+# A lightweight marker set to estimate whether a text is Traditional or Simplified.
+# This is not a full converter; it is only used as a tie-breaker when choosing
+# which duplicate source to keep. OpenCC is used for actual dedup normalization.
+TRAD_MARKER_RE = re.compile(r"[欽鑑綱紀記書國為爲舊開寶寶閭條維輯體廣萬與義實錄學東龍龍門師後臺臺萬]")
+SIMP_MARKER_RE = re.compile(r"[钦鉴纲纪记书国为旧开宝闾条维辑体广万与义实录学东龙门师后台台]")
+
 # Vietnamese/Latin letters. Used only for diagnostics.
 LATIN_RE = re.compile(r"[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]")
 
 WHITESPACE_RE = re.compile(r"\s+")
+
+# Keep filenames Windows-safe.
+# Windows commonly has MAX_PATH issues around 260 chars for the whole path.
+# So keep each filename conservative.
+MAX_FILENAME_LEN = 180
+MAX_DOC_PART_LEN = 50
+MAX_TITLE_PART_LEN = 55
+MAX_DOMAIN_PART_LEN = 45
 
 
 # =============================================================================
@@ -87,6 +107,7 @@ class Candidate:
     latin_chars: int
     han_ratio: float
     latin_ratio: float
+    traditional_score: float
 
     content_hash: str
     cjk_signature_len: int
@@ -126,19 +147,113 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
 def safe_filename(name: str, max_len: int = 120) -> str:
     """
     Make a safe filename while preserving readable Unicode.
+
+    Windows-invalid characters are replaced:
+        < > : " / \\ | ? *
+    Also removes control characters and trims trailing spaces/dots.
     """
     name = unicodedata.normalize("NFKC", str(name or "unknown"))
+
+    # Remove control chars.
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name)
+
+    # Replace Windows-invalid filename chars.
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+
+    # Collapse whitespace.
     name = re.sub(r"\s+", " ", name).strip()
+
+    # Windows dislikes trailing dots/spaces.
     name = name.strip(". ")
+
     if not name:
         name = "unknown"
-    return name[:max_len]
+
+    return name[:max_len].strip(". ")
 
 
 def short_hash(text: str, n: int = 10) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:n]
 
+
+def choose_title_for_filename(c: "Candidate", max_len: int = MAX_TITLE_PART_LEN) -> str:
+    """
+    Pick a readable but short title for the output TXT filename.
+
+    Priority:
+      1. html_title extracted from page
+      2. search-result title
+      3. doc_id
+
+    Long CText titles can contain many works joined together, so keep this short.
+    The full title is still preserved in _manifest.json.
+    """
+    title = (c.html_title or c.title or c.doc_id or "untitled").strip()
+
+    # Remove common site suffixes to keep filenames shorter.
+    title = re.sub(r"\s*[-_｜|]\s*Wikisource.*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*[-_｜|]\s*Chinese Text Project.*$", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s*[-_｜|]\s*中國哲學書電子化計劃.*$", "", title, flags=re.IGNORECASE)
+
+    return safe_filename(title, max_len=max_len)
+
+
+def build_output_filename(
+    c: "Candidate",
+    idx: int,
+    doc_id: str,
+    flat_output: bool = False,
+    flat_name_mode: str = "global_id",
+) -> str:
+    """
+    Build a readable but Windows-safe filename.
+
+    Non-flat per-doc output:
+        <local_id>__<title>__<domain>__<content_hash>.txt
+
+    Flat global output:
+        <global_id>__<title>__<domain>__<content_hash>.txt
+
+    If the filename is still too long, title is shortened further and
+    a title hash is added so different long titles remain distinguishable.
+    """
+    doc_part = safe_filename(doc_id, max_len=MAX_DOC_PART_LEN)
+    title_raw = (c.html_title or c.title or c.doc_id or "untitled").strip()
+    title_part = choose_title_for_filename(c, max_len=MAX_TITLE_PART_LEN)
+    title_hash = short_hash(title_raw, 6)
+    domain_part = safe_filename(c.domain or "unknown", max_len=MAX_DOMAIN_PART_LEN)
+    content_hash = c.content_hash[:10]
+
+    if flat_output and flat_name_mode == "doc_id":
+        filename = f"{doc_part}__{idx:04d}__{title_part}__{domain_part}__{content_hash}.txt"
+    else:
+        # Default for both:
+        #   flat/global    -> global id
+        #   per-doc folder -> local id
+        filename = f"{idx:04d}__{title_part}__{domain_part}__{content_hash}.txt"
+
+    if len(filename) <= MAX_FILENAME_LEN:
+        return filename
+
+    # Emergency shorter title version.
+    title_part = safe_filename(title_part, max_len=30)
+
+    if flat_output and flat_name_mode == "doc_id":
+        filename = f"{doc_part}__{idx:04d}__{title_part}-{title_hash}__{domain_part}__{content_hash}.txt"
+    else:
+        filename = f"{idx:04d}__{title_part}-{title_hash}__{domain_part}__{content_hash}.txt"
+
+    if len(filename) <= MAX_FILENAME_LEN:
+        return filename
+
+    # Last-resort minimal version.
+    doc_part = safe_filename(doc_id, max_len=35)
+    domain_part = safe_filename(c.domain or "unknown", max_len=30)
+
+    if flat_output and flat_name_mode == "doc_id":
+        return f"{doc_part}__{idx:04d}__{title_hash}__{domain_part}__{content_hash}.txt"
+
+    return f"{idx:04d}__{title_hash}__{domain_part}__{content_hash}.txt"
 
 def sha1_text(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -186,6 +301,131 @@ def language_ratios(text: str) -> Tuple[int, int, float, float]:
     return han, latin, han / total, latin / total
 
 
+def vertical_ocr_stats(text: str) -> Dict[str, Any]:
+    """
+    Detect PDF vertical text-layer / OCR extraction noise.
+
+    Typical bad extraction:
+        一
+        河
+        北
+        京
+        津
+        文
+        獻
+        第
+        四
+        十
+        三
+        期
+        目
+        錄
+
+    This can come from OCR or from a real PDF text layer with vertical layout.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    n_lines = len(lines)
+
+    if n_lines == 0:
+        return {
+            "n_lines": 0,
+            "one_han_lines": 0,
+            "short_han_lines": 0,
+            "vertical_line_ratio": 0.0,
+            "short_han_line_ratio": 0.0,
+            "avg_nonspace_len": 0.0,
+            "max_short_han_run": 0,
+            "max_one_han_run": 0,
+        }
+
+    one_han_lines = 0
+    short_han_lines = 0
+    total_nonspace_len = 0
+
+    cur_short_run = 0
+    max_short_run = 0
+
+    cur_one_run = 0
+    max_one_run = 0
+
+    for ln in lines:
+        compact = re.sub(r"\s+", "", ln)
+        nonspace_len = len(compact)
+        han_count = count_han_chars(ln)
+
+        total_nonspace_len += nonspace_len
+
+        is_one_han = han_count == 1 and nonspace_len <= 2
+        is_short_han = 1 <= han_count <= 2 and nonspace_len <= 3
+
+        if is_one_han:
+            one_han_lines += 1
+            cur_one_run += 1
+            max_one_run = max(max_one_run, cur_one_run)
+        else:
+            cur_one_run = 0
+
+        if is_short_han:
+            short_han_lines += 1
+            cur_short_run += 1
+            max_short_run = max(max_short_run, cur_short_run)
+        else:
+            cur_short_run = 0
+
+    return {
+        "n_lines": n_lines,
+        "one_han_lines": one_han_lines,
+        "short_han_lines": short_han_lines,
+        "vertical_line_ratio": one_han_lines / n_lines,
+        "short_han_line_ratio": short_han_lines / n_lines,
+        "avg_nonspace_len": total_nonspace_len / n_lines,
+        "max_short_han_run": max_short_run,
+        "max_one_han_run": max_one_run,
+    }
+
+
+def is_vertical_ocr_text(
+    text: str,
+    *,
+    min_lines: int = 30,
+    ratio_threshold: float = 0.60,
+    avg_len_threshold: float = 3.0,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Return True if text looks like vertical PDF/OCR extraction.
+
+    Triggers:
+      1. Whole-file vertical pattern:
+         many single-Han lines and very short average line length.
+
+      2. Long vertical run:
+         many consecutive 1-2 Han-character lines.
+         This catches PDFs where only part of the file is vertical front matter
+         or where the whole-file ratio is diluted by later normal text.
+    """
+    stats = vertical_ocr_stats(text)
+
+    if stats["n_lines"] < min_lines:
+        return False, stats
+
+    whole_file_vertical = (
+        (
+            stats["vertical_line_ratio"] >= ratio_threshold
+            or stats["short_han_line_ratio"] >= ratio_threshold
+        )
+        and stats["avg_nonspace_len"] <= avg_len_threshold
+    )
+
+    # Consecutive vertical-layout lines are a strong signal even if the
+    # whole file later contains normal paragraphs.
+    long_vertical_run = (
+        stats["max_one_han_run"] >= min_lines
+        or stats["max_short_han_run"] >= min_lines
+    )
+
+    return whole_file_vertical or long_vertical_run, stats
+
+
 # =============================================================================
 # Cleaning
 # =============================================================================
@@ -230,6 +470,32 @@ def remove_navigation_elements(text: str) -> str:
 
     # Stray arrow fragments.
     text = re.sub(r"[ \t]*[◄►].*?(\n|$)", "", text)
+
+    return text
+
+
+def remove_wikisource_edit_markers(text: str) -> str:
+    """
+    Remove Wikisource/Wikipedia UI markers that trafilatura/BS4 may leave behind.
+
+    Examples:
+        [编辑]先皇帝       -> 先皇帝
+        [編輯]先皇帝       -> 先皇帝
+        [编辑]| 维基百科条目：丁先皇 -> removed as a line
+    """
+    if not text:
+        return ""
+
+    # Remove inline edit markers.
+    text = re.sub(r"\[(编辑|編輯|edit)\]", "", text, flags=re.IGNORECASE)
+
+    # Remove Wikipedia pointer lines.
+    text = re.sub(
+        r"^\s*\|?\s*(维基百科条目|維基百科條目|Wikipedia article)\s*[:：].*$",
+        "",
+        text,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
 
     return text
 
@@ -360,6 +626,7 @@ def clean_text_for_export(
     # Source-specific structural cleanup.
     text = remove_ctext_pattern(text)
     text = remove_navigation_elements(text)
+    text = remove_wikisource_edit_markers(text)
     text = remove_common_boilerplate_lines(text)
 
     # Annotation/noise cleanup.
@@ -376,16 +643,28 @@ def clean_text_for_export(
 # Dedup signatures
 # =============================================================================
 
-def extreme_clean_for_compare(text: str, target_lang: str = "zh") -> str:
+def extreme_clean_for_compare(
+    text: str,
+    target_lang: str = "zh",
+    opencc_converter: Optional[Any] = None,
+) -> str:
     """
     Strip formatting/punctuation/noise and return only target-language chars.
     Used for dedup signature, not for exported text.
+
+    If opencc_converter is provided, Simplified/Traditional normalization is
+    applied before generating the signature. This lets dedup catch pairs like:
+        欽定越史通鑑綱目
+        钦定越史通鉴纲目
     """
     if not text:
         return ""
 
     # Remove bracketed notes for comparison only.
     text = re.sub(r"\[.*?\]|\(.*?\)|\{.*?\}|〈.*?〉|《.*?》|〔.*?〕|【.*?】|（.*?）", "", text)
+
+    if opencc_converter is not None:
+        text = opencc_converter.convert(text)
 
     if target_lang == "zh":
         return "".join(HAN_RE.findall(text))
@@ -427,6 +706,11 @@ def page_to_candidate(
     skip_ocr: bool,
     annotation_mode: str,
     unicode_form: str,
+    opencc_converter: Optional[Any] = None,
+    drop_vertical_ocr: bool = True,
+    vertical_min_lines: int = 30,
+    vertical_ratio_threshold: float = 0.60,
+    vertical_avg_len_threshold: float = 3.0,
 ) -> Tuple[Optional[Candidate], Optional[Dict[str, Any]]]:
     """
     Convert a page record into a clean Candidate or a rejection reason.
@@ -472,6 +756,28 @@ def page_to_candidate(
     if max_text_chars is not None and max_text_chars > 0:
         text = text[:max_text_chars].strip()
 
+    if drop_vertical_ocr:
+        is_vertical, vertical_stats = is_vertical_ocr_text(
+            text,
+            min_lines=vertical_min_lines,
+            ratio_threshold=vertical_ratio_threshold,
+            avg_len_threshold=vertical_avg_len_threshold,
+        )
+        if is_vertical:
+            text_len_tmp = len(text)
+            han_tmp, latin_tmp, h_ratio_tmp, l_ratio_tmp = language_ratios(text)
+            return None, {
+                "page_id": page_id,
+                "reason": "vertical_ocr_text",
+                "url": url,
+                "text_len": text_len_tmp,
+                "han_chars": han_tmp,
+                "latin_chars": latin_tmp,
+                "han_ratio": h_ratio_tmp,
+                "latin_ratio": l_ratio_tmp,
+                "vertical_stats": vertical_stats,
+            }
+
     text_len = len(text)
     han, latin, h_ratio, l_ratio = language_ratios(text)
 
@@ -511,7 +817,13 @@ def page_to_candidate(
             "latin_ratio": l_ratio,
         }
 
-    signature = extreme_clean_for_compare(text, target_lang="zh")
+    signature = extreme_clean_for_compare(
+        text,
+        target_lang="zh",
+        opencc_converter=opencc_converter,
+    )
+    trad_score = traditional_score(text)
+
     if not signature:
         return None, {
             "page_id": page_id,
@@ -537,6 +849,7 @@ def page_to_candidate(
         latin_chars=latin,
         han_ratio=h_ratio,
         latin_ratio=l_ratio,
+        traditional_score=trad_score,
 
         content_hash=content_hash,
         cjk_signature_len=len(signature),
@@ -559,6 +872,7 @@ def page_to_candidate(
 def collect_candidates_from_file(
     page_json_path: Path,
     args: argparse.Namespace,
+    opencc_converter: Optional[Any] = None,
 ) -> Tuple[str, List[Candidate], List[Dict[str, Any]]]:
     data = read_json(page_json_path)
     doc_id = str(data.get("doc_id") or page_json_path.stem)
@@ -583,6 +897,11 @@ def collect_candidates_from_file(
             skip_ocr=not args.keep_ocr_needed,
             annotation_mode=args.annotation_mode,
             unicode_form=args.unicode_form,
+            opencc_converter=opencc_converter,
+            drop_vertical_ocr=not args.keep_vertical_ocr,
+            vertical_min_lines=args.vertical_min_lines,
+            vertical_ratio_threshold=args.vertical_ratio_threshold,
+            vertical_avg_len_threshold=args.vertical_avg_len_threshold,
         )
 
         if cand is not None:
@@ -597,19 +916,27 @@ def collect_candidates_from_file(
 # Candidate ranking and dedup
 # =============================================================================
 
-def candidate_quality_key(c: Candidate, trusted_domains: Set[str]) -> Tuple[float, float, int, int]:
+def candidate_quality_key(
+    c: Candidate,
+    trusted_domains: Set[str],
+    prefer_traditional: bool = False,
+) -> Tuple[float, float, float, int, int]:
     """
     Higher is better.
 
     Preference:
       1. trusted domain
-      2. high Han ratio
-      3. more Han chars
-      4. longer text
+      2. Traditional score, if --prefer_traditional is enabled
+      3. high Han ratio
+      4. more Han chars
+      5. longer text
     """
     domain_score = 1.0 if c.domain.lower() in trusted_domains else 0.0
+    trad_score = c.traditional_score if prefer_traditional else 0.0
+
     return (
         domain_score,
+        trad_score,
         c.han_ratio,
         c.han_chars,
         c.text_len,
@@ -620,6 +947,7 @@ def exact_dedup_candidates(
     candidates: List[Candidate],
     scope: str,
     trusted_domains: Set[str],
+    prefer_traditional: bool = False,
 ) -> Tuple[List[Candidate], List[Dict[str, Any]]]:
     """
     Dedup by exact Han-only content hash.
@@ -644,7 +972,7 @@ def exact_dedup_candidates(
 
         sorted_group = sorted(
             group,
-            key=lambda x: candidate_quality_key(x, trusted_domains),
+            key=lambda x: candidate_quality_key(x, trusted_domains, prefer_traditional=prefer_traditional),
             reverse=True,
         )
 
@@ -672,6 +1000,8 @@ def near_dedup_candidates(
     ngram_n: int,
     scope: str,
     trusted_domains: Set[str],
+    prefer_traditional: bool = False,
+    opencc_converter: Optional[Any] = None,
     verbose: bool = False,
 ) -> Tuple[List[Candidate], List[Dict[str, Any]]]:
     """
@@ -685,13 +1015,17 @@ def near_dedup_candidates(
     # Sort best-first. When duplicates are found, keep the earlier/better candidate.
     ordered = sorted(
         candidates,
-        key=lambda x: candidate_quality_key(x, trusted_domains),
+        key=lambda x: candidate_quality_key(x, trusted_domains, prefer_traditional=prefer_traditional),
         reverse=True,
     )
 
     signatures: Dict[int, Set[str]] = {}
     for i, c in enumerate(ordered):
-        sig = extreme_clean_for_compare(c.text, target_lang="zh")
+        sig = extreme_clean_for_compare(
+            c.text,
+            target_lang="zh",
+            opencc_converter=opencc_converter,
+        )
         signatures[i] = get_character_ngrams(sig, n=ngram_n)
 
     keep_indices: List[int] = []
@@ -750,6 +1084,7 @@ def export_candidates(
     rejected_by_doc: Dict[str, List[Dict[str, Any]]],
     output_dir: Path,
     flat_output: bool = False,
+    flat_name_mode: str = "global_id",
 ) -> Dict[str, Any]:
     """
     Write TXT files and manifests.
@@ -763,34 +1098,45 @@ def export_candidates(
     docs_summary = []
     total_exported = 0
 
+    global_idx = 0
+
     for doc_id, doc_candidates in sorted(by_doc.items(), key=lambda x: x[0]):
         if flat_output:
-            doc_dir = output_dir
+            txt_dir = output_dir
+            manifest_dir = output_dir / "_manifests"
         else:
-            doc_dir = output_dir / safe_filename(doc_id)
+            txt_dir = output_dir / safe_filename(doc_id)
+            manifest_dir = txt_dir
 
-        doc_dir.mkdir(parents=True, exist_ok=True)
+        txt_dir.mkdir(parents=True, exist_ok=True)
+        manifest_dir.mkdir(parents=True, exist_ok=True)
 
         exported_records = []
 
         # stable order: page_id then domain
         doc_candidates = sorted(doc_candidates, key=lambda c: (c.page_id, c.domain, c.content_hash))
 
-        for idx, c in enumerate(doc_candidates, start=1):
-            domain = safe_filename(c.domain or "unknown", max_len=60)
-            h = c.content_hash[:10]
+        for local_idx, c in enumerate(doc_candidates, start=1):
+            global_idx += 1
+            filename_idx = global_idx if flat_output else local_idx
 
-            if flat_output:
-                filename = f"{safe_filename(doc_id, 80)}__{idx:04d}__{domain}__{h}.txt"
-            else:
-                filename = f"{idx:04d}__{domain}__{h}.txt"
+            filename = build_output_filename(
+                c,
+                idx=filename_idx,
+                doc_id=doc_id,
+                flat_output=flat_output,
+                flat_name_mode=flat_name_mode,
+            )
 
-            txt_path = doc_dir / filename
+            txt_path = txt_dir / filename
             txt_path.write_text(c.text, encoding="utf-8")
 
             c.txt_path = str(txt_path)
 
             record = asdict(c)
+            record["global_id"] = global_idx
+            record["local_id"] = local_idx
+
             # Do not duplicate full text inside manifest.
             record.pop("text", None)
             exported_records.append(record)
@@ -803,7 +1149,11 @@ def export_candidates(
             "rejected": rejected_by_doc.get(doc_id, []),
         }
 
-        manifest_path = doc_dir / "_manifest.json"
+        if flat_output:
+            manifest_path = manifest_dir / f"{safe_filename(doc_id, 100)}__manifest.json"
+        else:
+            manifest_path = manifest_dir / "_manifest.json"
+
         write_json(manifest_path, manifest)
 
         docs_summary.append({
@@ -871,6 +1221,32 @@ def main() -> None:
         action="store_true",
         help="Keep pages marked needs_ocr=True. Default: skip them.",
     )
+    parser.add_argument(
+        "--keep_vertical_ocr",
+        action="store_true",
+        help=(
+            "Keep pages that look like vertical PDF/OCR extraction, e.g. one Han "
+            "character per line. Default is to drop them."
+        ),
+    )
+    parser.add_argument(
+        "--vertical_min_lines",
+        type=int,
+        default=30,
+        help="Minimum non-empty lines, also used as minimum consecutive vertical-line run length.",
+    )
+    parser.add_argument(
+        "--vertical_ratio_threshold",
+        type=float,
+        default=0.60,
+        help="Drop if this fraction of non-empty lines are single-Han-character lines.",
+    )
+    parser.add_argument(
+        "--vertical_avg_len_threshold",
+        type=float,
+        default=3.0,
+        help="Drop vertical OCR only if average non-space line length is <= this value.",
+    )
 
     # Cleaning
     parser.add_argument(
@@ -897,6 +1273,21 @@ def main() -> None:
         help="global = dedup across all docs; doc = dedup inside each doc only.",
     )
     parser.add_argument(
+        "--dedup_opencc",
+        type=str,
+        choices=["none", "s2t", "t2s"],
+        default="none",
+        help=(
+            "Normalize Simplified/Traditional Chinese before dedup only. "
+            "Use s2t if you prefer Traditional output candidates."
+        ),
+    )
+    parser.add_argument(
+        "--prefer_traditional",
+        action="store_true",
+        help="When duplicates are found, prefer the candidate that looks more Traditional Chinese.",
+    )
+    parser.add_argument(
         "--disable_exact_dedup",
         action="store_true",
         help="Disable exact dedup by Han-only content hash.",
@@ -921,11 +1312,6 @@ def main() -> None:
 
     # Output
     parser.add_argument(
-        "--flat_output",
-        action="store_true",
-        help="Write all TXT files directly under output_dir instead of per-doc folders.",
-    )
-    parser.add_argument(
         "--trusted_domains",
         type=str,
         default="ctext.org,zh.wikisource.org,wikisource.org,shidianguji.com,guoxuemi.com",
@@ -948,6 +1334,24 @@ def main() -> None:
 
     trusted_domains = parse_trusted_domains(args.trusted_domains)
 
+    opencc_converter = None
+    if args.dedup_opencc != "none":
+        if OpenCC is None:
+            raise ImportError(
+                "OpenCC is required for --dedup_opencc. "
+                "Install it with: pip install opencc-python-reimplemented"
+            )
+        opencc_converter = OpenCC(args.dedup_opencc)
+
+    # Auto output layout:
+    #   --dedup_scope global -> flat corpus, filenames use global ids:
+    #       0001__title__domain__hash.txt
+    #
+    #   --dedup_scope doc -> per-doc folders, filenames keep local ids:
+    #       <doc_id>/0001__title__domain__hash.txt
+    flat_output = args.dedup_scope == "global"
+    flat_name_mode = "global_id" if flat_output else "doc_id"
+
     all_candidates: List[Candidate] = []
     rejected_by_doc: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -958,13 +1362,21 @@ def main() -> None:
         print(f"[*] Output dir:     {output_dir}")
         print(f"[*] JSON files:     {len(json_files)}")
         print(f"[*] min_han_ratio:  {args.min_han_ratio}")
+        print(f"[*] drop vertical:  {not args.keep_vertical_ocr}")
         print(f"[*] exact dedup:    {not args.disable_exact_dedup}")
         print(f"[*] near dedup:     {args.near_dedup}")
+        print(f"[*] dedup_opencc:   {args.dedup_opencc}")
+        print(f"[*] prefer trad:    {args.prefer_traditional}")
+        print(f"[*] output layout:  {'flat/global-id' if flat_output else 'per-doc/local-id'}")
         print("=" * 80)
 
     # Phase 1: collect + filter + clean
     for path in json_files:
-        doc_id, candidates, rejections = collect_candidates_from_file(path, args)
+        doc_id, candidates, rejections = collect_candidates_from_file(
+            path,
+            args,
+            opencc_converter=opencc_converter,
+        )
 
         all_candidates.extend(candidates)
         add_rejections_by_doc(rejected_by_doc, rejections, fallback_doc_id=doc_id)
@@ -985,6 +1397,7 @@ def main() -> None:
             all_candidates,
             scope=args.dedup_scope,
             trusted_domains=trusted_domains,
+            prefer_traditional=args.prefer_traditional,
         )
         add_rejections_by_doc(rejected_by_doc, exact_rejections)
 
@@ -999,6 +1412,8 @@ def main() -> None:
             ngram_n=args.ngram_n,
             scope=args.dedup_scope,
             trusted_domains=trusted_domains,
+            prefer_traditional=args.prefer_traditional,
+            opencc_converter=opencc_converter,
             verbose=args.verbose,
         )
         add_rejections_by_doc(rejected_by_doc, near_rejections)
@@ -1010,7 +1425,8 @@ def main() -> None:
         candidates=all_candidates,
         rejected_by_doc=rejected_by_doc,
         output_dir=output_dir,
-        flat_output=args.flat_output,
+        flat_output=flat_output,
+        flat_name_mode=flat_name_mode,
     )
 
     summary = {
@@ -1030,15 +1446,22 @@ def main() -> None:
             "min_han_ratio": args.min_han_ratio,
             "max_text_chars": args.max_text_chars,
             "skip_ocr": not args.keep_ocr_needed,
+            "drop_vertical_ocr": not args.keep_vertical_ocr,
+            "vertical_min_lines": args.vertical_min_lines,
+            "vertical_ratio_threshold": args.vertical_ratio_threshold,
+            "vertical_avg_len_threshold": args.vertical_avg_len_threshold,
             "annotation_mode": args.annotation_mode,
             "unicode_form": args.unicode_form,
             "dedup_scope": args.dedup_scope,
+            "dedup_opencc": args.dedup_opencc,
+            "prefer_traditional": args.prefer_traditional,
             "exact_dedup": not args.disable_exact_dedup,
             "near_dedup": args.near_dedup,
             "near_threshold": args.near_threshold,
             "ngram_n": args.ngram_n,
             "trusted_domains": sorted(trusted_domains),
-            "flat_output": args.flat_output,
+            "flat_output": flat_output,
+            "flat_name_mode": flat_name_mode,
         },
         "docs": export_summary["docs"],
     }
