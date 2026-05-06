@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 Export clean TXT corpus from fetch_pages.py JSON outputs.
 
@@ -300,6 +297,26 @@ def language_ratios(text: str) -> Tuple[int, int, float, float]:
 
     return han, latin, han / total, latin / total
 
+def traditional_score(text: str) -> float:
+    """
+    Heuristic score for preferring Traditional Chinese sources.
+
+    Returns:
+        trad_marker_count / (trad_marker_count + simp_marker_count)
+
+    If there are no markers, returns 0.5 as neutral.
+    """
+    if not text:
+        return 0.5
+
+    trad = len(TRAD_MARKER_RE.findall(text))
+    simp = len(SIMP_MARKER_RE.findall(text))
+    total = trad + simp
+
+    if total == 0:
+        return 0.5
+
+    return trad / total
 
 def vertical_ocr_stats(text: str) -> Dict[str, Any]:
     """
@@ -690,6 +707,58 @@ def calculate_containment(set_a: Set[str], set_b: Set[str]) -> float:
         return 0.0
     return len(set_a.intersection(set_b)) / min(len(set_a), len(set_b))
 
+def calculate_jaccard(set_a: Set[str], set_b: Set[str]) -> float:
+    """
+    Jaccard similarity: |A ∩ B| / |A ∪ B|
+    """
+    if not set_a and not set_b:
+        return 1.0  # Both empty = identical
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union > 0 else 0.0
+
+
+def calculate_containment_asymmetric(
+    set_a: Set[str], 
+    set_b: Set[str]
+) -> Tuple[float, float]:
+    """
+    Returns (containment of A in B, containment of B in A)
+    
+    containment_a_in_b: What fraction of A appears in B?
+    containment_b_in_a: What fraction of B appears in A?
+    """
+    if not set_a or not set_b:
+        return 0.0, 0.0
+    intersection = len(set_a & set_b)
+    return (
+        intersection / len(set_a),  # A in B
+        intersection / len(set_b),  # B in A
+    )
+
+
+def calculate_similarity_metrics(
+    set_a: Set[str], 
+    set_b: Set[str]
+) -> Dict[str, float]:
+    """
+    Calculate all similarity metrics at once.
+    """
+    if not set_a and not set_b:
+        return {"jaccard": 1.0, "containment_a_in_b": 1.0, "containment_b_in_a": 1.0}
+    if not set_a or not set_b:
+        return {"jaccard": 0.0, "containment_a_in_b": 0.0, "containment_b_in_a": 0.0}
+    
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    
+    return {
+        "jaccard": intersection / union if union > 0 else 0.0,
+        "containment_a_in_b": intersection / len(set_a),
+        "containment_b_in_a": intersection / len(set_b),
+    }
 
 # =============================================================================
 # Candidate extraction
@@ -920,28 +989,18 @@ def candidate_quality_key(
     c: Candidate,
     trusted_domains: Set[str],
     prefer_traditional: bool = False,
-) -> Tuple[float, float, float, int, int]:
+    prefer_longer: bool = False,
+) -> Tuple[float, float, int, float, int]:
     """
     Higher is better.
-
-    Preference:
-      1. trusted domain
-      2. Traditional score, if --prefer_traditional is enabled
-      3. high Han ratio
-      4. more Han chars
-      5. longer text
+    Default: domain > trad > han_ratio > han_chars > text_len
+    With prefer_longer: domain > trad > text_len > han_chars > han_ratio
     """
     domain_score = 1.0 if c.domain.lower() in trusted_domains else 0.0
     trad_score = c.traditional_score if prefer_traditional else 0.0
-
-    return (
-        domain_score,
-        trad_score,
-        c.han_ratio,
-        c.han_chars,
-        c.text_len,
-    )
-
+    if prefer_longer:
+        return (domain_score, trad_score, c.text_len, c.han_chars, c.han_ratio)
+    return (domain_score, trad_score, c.han_ratio, c.han_chars, c.text_len)
 
 def exact_dedup_candidates(
     candidates: List[Candidate],
@@ -1001,32 +1060,46 @@ def near_dedup_candidates(
     scope: str,
     trusted_domains: Set[str],
     prefer_traditional: bool = False,
+    prefer_longer: bool = True,  # Default True now
     opencc_converter: Optional[Any] = None,
+    similarity_mode: str = "jaccard",  # "jaccard", "containment", "containment_asym"
     verbose: bool = False,
 ) -> Tuple[List[Candidate], List[Dict[str, Any]]]:
     """
-    Near dedup by character n-gram containment.
-
-    This is O(n^2), so use only after exact dedup and quality filtering.
+    Near dedup by character n-gram similarity.
+    
+    similarity_mode:
+        - "jaccard": Symmetric Jaccard similarity
+        - "containment": Min-containment (original behavior)
+        - "containment_asym": Asymmetric containment, keeps longer doc
     """
     if not candidates:
         return [], []
 
-    # Sort best-first. When duplicates are found, keep the earlier/better candidate.
+    # Sort best-first based on quality
     ordered = sorted(
         candidates,
-        key=lambda x: candidate_quality_key(x, trusted_domains, prefer_traditional=prefer_traditional),
+        key=lambda x: candidate_quality_key(
+            x, 
+            trusted_domains, 
+            prefer_traditional=prefer_traditional,
+            prefer_longer=prefer_longer,
+        ),
         reverse=True,
     )
 
-    signatures: Dict[int, Set[str]] = {}
+    # Pre-compute signatures and ngram sets
+    signatures: Dict[int, str] = {}
+    ngram_sets: Dict[int, Set[str]] = {}
+    
     for i, c in enumerate(ordered):
         sig = extreme_clean_for_compare(
             c.text,
             target_lang="zh",
             opencc_converter=opencc_converter,
         )
-        signatures[i] = get_character_ngrams(sig, n=ngram_n)
+        signatures[i] = sig
+        ngram_sets[i] = get_character_ngrams(sig, n=ngram_n)
 
     keep_indices: List[int] = []
     dropped_indices: Set[int] = set()
@@ -1035,45 +1108,82 @@ def near_dedup_candidates(
     for i, cand_i in enumerate(ordered):
         if i in dropped_indices:
             continue
-
+        
         keep_indices.append(i)
-
+        set_i = ngram_sets[i]
+        
         for j in range(i + 1, len(ordered)):
             if j in dropped_indices:
                 continue
-
+            
             cand_j = ordered[j]
-
+            
             if scope == "doc" and cand_i.doc_id != cand_j.doc_id:
                 continue
-
-            score = calculate_containment(signatures[i], signatures[j])
-
-            if score >= threshold:
+            
+            set_j = ngram_sets[j]
+            
+            # Calculate similarity based on mode
+            is_duplicate = False
+            score = 0.0
+            drop_reason = ""
+            
+            if similarity_mode == "jaccard":
+                score = calculate_jaccard(set_i, set_j)
+                is_duplicate = score >= threshold
+                drop_reason = f"jaccard={score:.3f}"
+                
+            elif similarity_mode == "containment":
+                # Original min-containment
+                score = calculate_containment(set_i, set_j)
+                is_duplicate = score >= threshold
+                drop_reason = f"containment={score:.3f}"
+                
+            elif similarity_mode == "containment_asym":
+                # Asymmetric: check if j is contained in i
+                # Since i is "better" (sorted first), we keep i and drop j if j ⊂ i
+                cont_i_in_j, cont_j_in_i = calculate_containment_asymmetric(set_i, set_j)
+                
+                # j is mostly contained in i → drop j (the shorter/worse one)
+                if cont_j_in_i >= threshold:
+                    is_duplicate = True
+                    score = cont_j_in_i
+                    drop_reason = f"j_in_i={cont_j_in_i:.3f}"
+                # Or high mutual overlap
+                elif min(cont_i_in_j, cont_j_in_i) >= threshold * 0.9:
+                    is_duplicate = True
+                    score = min(cont_i_in_j, cont_j_in_i)
+                    drop_reason = f"mutual={score:.3f}"
+            
+            if is_duplicate:
                 dropped_indices.add(j)
-
                 rejected.append({
                     "page_id": cand_j.page_id,
                     "doc_id": cand_j.doc_id,
                     "reason": "duplicate_near",
-                    "url": cand_j.canonical_url or cand_j.final_url or cand_j.url,
-                    "near_score": score,
+                    "similarity_mode": similarity_mode,
+                    "similarity_score": score,
                     "threshold": threshold,
+                    "url": cand_j.canonical_url or cand_j.final_url or cand_j.url,
+                    "text_len": cand_j.text_len,
                     "kept_doc_id": cand_i.doc_id,
                     "kept_page_id": cand_i.page_id,
                     "kept_url": cand_i.canonical_url or cand_i.final_url or cand_i.url,
+                    "kept_text_len": cand_i.text_len,
                 })
-
                 if verbose:
+                    drop_title = cand_j.html_title or cand_j.title or cand_j.url
+                    keep_title = cand_i.html_title or cand_i.title or cand_i.url
                     print(
-                        f"[near-dup] DROP {cand_j.doc_id}/{cand_j.page_id} "
-                        f"KEEP {cand_i.doc_id}/{cand_i.page_id} "
-                        f"score={score:.3f}"
-                    )
+                        f"[near-dup] DROP: {drop_title[:60]}\n"
+                        f"           (len={cand_j.text_len:,}, {cand_j.domain})\n"
+                        f"     KEEP: {keep_title[:60]}\n"
+                        f"           (len={cand_i.text_len:,}, {cand_i.domain})\n"
+                        f"     {drop_reason} >= {threshold}\n"
+                    )                
 
-    kept = [ordered[i] for i in keep_indices if i not in dropped_indices]
+    kept = [ordered[i] for i in keep_indices]
     return kept, rejected
-
 
 # =============================================================================
 # Export
@@ -1310,6 +1420,21 @@ def main() -> None:
         help="Character n-gram size for near dedup.",
     )
 
+    parser.add_argument(
+        "--similarity_mode",
+        type=str,
+        choices=["jaccard", "containment", "containment_asym"],
+        default="jaccard",
+        help="Near-dedup similarity metric (default: jaccard).",
+    )
+    
+    parser.add_argument(
+        "--prefer_longer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prefer longer text when deduplicating (default: True).",
+    )
+
     # Output
     parser.add_argument(
         "--trusted_domains",
@@ -1413,7 +1538,9 @@ def main() -> None:
             scope=args.dedup_scope,
             trusted_domains=trusted_domains,
             prefer_traditional=args.prefer_traditional,
+            prefer_longer=args.prefer_longer,
             opencc_converter=opencc_converter,
+            similarity_mode=args.similarity_mode,
             verbose=args.verbose,
         )
         add_rejections_by_doc(rejected_by_doc, near_rejections)
