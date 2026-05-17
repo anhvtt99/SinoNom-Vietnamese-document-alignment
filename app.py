@@ -1,10 +1,20 @@
-import json
-import shlex
-import subprocess
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+from lib.ui_helper import (
+    INPUT_DIR_MODE,
+    UPLOAD_FILE_MODE,
+    build_keyword_command,
+    build_query_command,
+    build_search_command,
+    build_crawl_command,
+    collect_json_files,
+    collect_txt_files,
+    run_command_stream,
+    shell_command,
+)
 
 
 st.set_page_config(
@@ -13,207 +23,97 @@ st.set_page_config(
 )
 
 
-INPUT_DIR_MODE = "Use input directory"
-UPLOAD_FILE_MODE = "Upload one .txt file"
-
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR
 
-DEFAULTS = {
-    "input_mode": INPUT_DIR_MODE,
-    "uploaded_input_path": "",
-    "input_dir": str(PROJECT_DIR / "data/In/Txt_Viet/Viet_chapters"),
-    "upload_dir": str(PROJECT_DIR / "ui_uploads"),
-    "output_dir": str(PROJECT_DIR / "keyword"),
-    "ner_model_name": "NlpHUST/ner-vietnamese-electra-base",
-    "sbert_model_name": "bkai-foundation-models/vietnamese-bi-encoder",
-    "stopwords_path": str(PROJECT_DIR / "lib/resources/stopwords_vi.txt"),
-    "recursive": True,
-}
 
+def make_keyword_defaults(project_dir: Path) -> dict:
+    return {
+        "input_mode": INPUT_DIR_MODE,
+        "uploaded_input_path": "",
+        "input_dir": str(project_dir / "data/In/Txt_Viet/Viet_chapters"),
+        "upload_dir": str(project_dir / "ui_uploads"),
+        "output_dir": str(project_dir / "keyword"),
+        "ner_model_name": "NlpHUST/ner-vietnamese-electra-base",
+        "sbert_model_name": "bkai-foundation-models/vietnamese-bi-encoder",
+        "stopwords_path": str(project_dir / "lib/resources/stopwords_vi.txt"),
+        "recursive": True,
+    }
+
+
+def make_query_defaults(keyword_output_dir: str) -> dict:
+    run_root = Path(keyword_output_dir).parent
+    return {
+        "keyword_input_dir": keyword_output_dir,
+        "query_output_dir": str(run_root / "queries"),
+        "translation_cache_dir": str(run_root / "cache/translation"),
+        "translate_gemini": True,
+        "gemini_model_name": "models/gemini-2.5-pro",
+        "translation_batch_size": 50,
+        "use_wikisource_rerank": True,
+        "wikisource_rerank_scope": "all",
+        "wikisource_rerank_top_k": 7,
+        "anchor_only": False,
+        "use_local_query": False,
+        "min_total_query": 4,
+        "top_n_keywords": 15,
+        "rarity_bias": 0.2,
+        "num_query_terms": 6,
+        "num_exact_anchors": 3,
+        "use_site_restriction": False,
+        "sites": "zh.wikisource.org,ctext.org",
+    }
+
+def make_search_crawl_defaults(query_output_dir: str) -> dict:
+    run_root = Path(query_output_dir).parent
+
+    return {
+        "query_dir": query_output_dir,
+        "url_dir": str(run_root / "urls"),
+        "page_dir": str(run_root / "pages"),
+
+        "search_backend": "serper",
+        "num_results": 10,
+        "include_omitted": True,
+        "early_stop_url_count": 3,
+
+        "sleep_min": 3.0,
+        "sleep_max": 6.0,
+        "timeout": 20,
+        "min_text_len": 200,
+        "collect_assets": True,
+    }
 
 def init_state():
     if "kw_config" not in st.session_state:
-        st.session_state["kw_config"] = DEFAULTS.copy()
-    if "input_files" not in st.session_state:
-        st.session_state["input_files"] = []
-    if "keyword_cmd" not in st.session_state:
-        st.session_state["keyword_cmd"] = []
+        st.session_state["kw_config"] = make_keyword_defaults(PROJECT_DIR)
+
     if "query_config" not in st.session_state:
-        st.session_state["query_config"] = {}
-    if "query_cmd" not in st.session_state:
-        st.session_state["query_cmd"] = []
+        st.session_state["query_config"] = make_query_defaults(
+            st.session_state["kw_config"]["output_dir"]
+        )
+
+    if "search_crawl_config" not in st.session_state:
+        st.session_state["search_crawl_config"] = make_search_crawl_defaults(
+            st.session_state["query_config"]["query_output_dir"]
+        )
+    st.session_state.setdefault("input_files", [])
+    st.session_state.setdefault("keyword_cmd", [])
+    st.session_state.setdefault("query_cmd", [])
+    st.session_state.setdefault("search_cmd", [])
+    st.session_state.setdefault("crawl_cmd", [])
 
 
-def q(x: str) -> str:
-    return shlex.quote(str(x))
+def render_file_table(files: list[Path], max_rows: int = 200):
+    df = pd.DataFrame({
+        "file": [str(p) for p in files[:max_rows]],
+        "name": [p.name for p in files[:max_rows]],
+        "size_bytes": [p.stat().st_size if p.exists() else None for p in files[:max_rows]],
+    })
+    st.dataframe(df, use_container_width=True)
 
 
-def shell_command(cmd: list[str]) -> str:
-    return " ".join(q(x) for x in cmd)
-
-
-def collect_txt_files(cfg: dict):
-    if cfg.get("input_mode") == UPLOAD_FILE_MODE:
-        p = Path(cfg.get("uploaded_input_path", ""))
-        if p.exists() and p.suffix.lower() == ".txt":
-            return [p]
-        return []
-
-    root = Path(cfg.get("input_dir", ""))
-    if not root.exists():
-        return []
-
-    return sorted(
-        root.rglob("*.txt") if cfg.get("recursive", True)
-        else root.glob("*.txt")
-    )
-
-
-def build_keyword_command(cfg: dict) -> list[str]:
-    cmd = ["python", "-m", "lib.web.VnKeywordExtractor"]
-
-    if cfg.get("input_mode") == UPLOAD_FILE_MODE:
-        cmd.extend(["--input_path", cfg.get("uploaded_input_path", "")])
-    else:
-        cmd.extend(["--input_dir", cfg.get("input_dir", "")])
-
-    cmd.extend([
-        "--output_dir", cfg.get("output_dir", ""),
-        "--ner_model_name", cfg.get("ner_model_name", ""),
-        "--sbert_model_name", cfg.get("sbert_model_name", ""),
-        "--stopwords_path", cfg.get("stopwords_path", ""),
-    ])
-
-    if cfg.get("input_mode") == INPUT_DIR_MODE and cfg.get("recursive", True):
-        cmd.append("--recursive")
-
-    if st.session_state.get("global_verbose", True):
-        cmd.append("--verbose")
-
-    return cmd
-
-
-def collect_keyword_json_files(keyword_dir: str, recursive: bool = True):
-    root = Path(keyword_dir)
-    if not root.exists():
-        return []
-    return sorted(root.rglob("*.json") if recursive else root.glob("*.json"))
-
-
-def build_query_command(cfg: dict) -> list[str]:
-    cmd = ["python", "-m", "lib.web.build_query"]
-
-    if cfg.get("query_input_mode") == "Single keyword JSON":
-        cmd.extend([
-            "--keyword_path", cfg.get("keyword_path", ""),
-            "--output_path", cfg.get("query_output_path", ""),
-        ])
-    else:
-        cmd.extend([
-            "--input_dir", cfg.get("keyword_input_dir", ""),
-            "--output_dir", cfg.get("query_output_dir", ""),
-        ])
-
-        cmd.append("--recursive")
-
-    cmd.extend([
-        "--src_lang", "vi",
-        "--tgt_lang", "zh",
-        "--translation_cache_dir", cfg.get("translation_cache_dir", ""),
-        "--top_n_keywords", str(cfg.get("top_n_keywords", 15)),
-        "--rarity_bias", str(cfg.get("rarity_bias", 0.2)),
-        "--min_total_query", str(cfg.get("min_total_query", 4)),
-        "--num_query_terms", str(cfg.get("num_query_terms", 6)),
-        "--num_exact_anchors", str(cfg.get("num_exact_anchors", 3)),
-        "--wikisource_rerank_scope", cfg.get("wikisource_rerank_scope", "all"),
-        "--wikisource_rerank_top_k", str(cfg.get("wikisource_rerank_top_k", 7)),
-        "--translation_batch_size", str(cfg.get("translation_batch_size", 50)),
-    ])
-
-    if cfg.get("translate_gemini", True):
-        cmd.append("--translate_gemini")
-        if cfg.get("gemini_model_name"):
-            cmd.extend(["--gemini_model_name", cfg.get("gemini_model_name")])
-
-    if cfg.get("use_wikisource_rerank", True):
-        cmd.append("--use_wikisource_rerank")
-
-    if cfg.get("anchor_only", True):
-        cmd.append("--anchor_only")
-
-    if cfg.get("use_local_query", False):
-        cmd.append("--use_local_query")
-
-    if cfg.get("allow_semantic_fallback_terms", False):
-        cmd.append("--allow_semantic_fallback_terms")
-
-    if cfg.get("use_site_restriction", False):
-        cmd.append("--use_site_restriction")
-        sites = [x.strip() for x in str(cfg.get("sites", "")).split(",") if x.strip()]
-        if sites:
-            cmd.append("--sites")
-            cmd.extend(sites)
-
-    if st.session_state.get("global_verbose", True):
-        cmd.append("--verbose")
-
-    return cmd
-
-
-def save_config(cfg: dict, path: str):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_config(path: str):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def run_command_stream(cmd: list[str], cwd: str | Path = PROJECT_DIR):
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    for line in process.stdout:
-        yield line
-
-    process.wait()
-
-    if process.returncode != 0:
-        raise RuntimeError(f"Command failed with exit code {process.returncode}")
-
-
-
-init_state()
-
-st.title("Quốc ngữ → Hán Pipeline UI")
-st.caption("v1 — Keyword Extraction → Build Queries")
-
-st.sidebar.header("Global settings")
-
-global_verbose = st.sidebar.checkbox(
-    "Verbose logs",
-    value=st.session_state.get("global_verbose", True),
-    key="global_verbose",
-)
-
-st.sidebar.caption(f"Project dir: `{PROJECT_DIR}`")
-
-tab1, tab2, tab3 = st.tabs([
-    "1. Keyword Extraction",
-    "2. Build Queries",
-    "3. Query Viewer",
-])
-
-
-with tab1:
+def render_keyword_extraction_tab():
     st.header("1. Keyword Extraction")
 
     cfg = st.session_state["kw_config"]
@@ -245,10 +145,12 @@ with tab1:
             mode_options,
             index=mode_options.index(default_mode),
             horizontal=True,
+            key="kw_input_mode",
         )
 
         input_dir = cfg.get("input_dir", "")
-        upload_dir = cfg.get("upload_dir", DEFAULTS["upload_dir"])
+        keyword_defaults = make_keyword_defaults(PROJECT_DIR)
+        upload_dir = cfg.get("upload_dir", keyword_defaults["upload_dir"])
         uploaded_input_path = cfg.get("uploaded_input_path", "")
 
         if input_mode == INPUT_DIR_MODE:
@@ -256,17 +158,20 @@ with tab1:
                 "Input directory",
                 value=input_dir,
                 help="Folder chứa nhiều file .txt Quốc ngữ.",
+                key="kw_input_dir",
             )
         else:
             upload_dir = st.text_input(
                 "Upload save directory",
                 value=upload_dir,
                 help="File upload sẽ được lưu vào folder này.",
+                key="kw_upload_dir",
             )
 
             uploaded_file = st.file_uploader(
                 "Upload one .txt file",
                 type=["txt"],
+                key="kw_uploaded_file",
             )
 
             if uploaded_file is not None:
@@ -283,6 +188,7 @@ with tab1:
                     "Preview uploaded text",
                     value=preview_text[:3000],
                     height=220,
+                    key="kw_upload_preview",
                 )
             elif uploaded_input_path:
                 st.info(f"Using previously uploaded file: {uploaded_input_path}")
@@ -291,11 +197,13 @@ with tab1:
             "Keyword output directory",
             value=cfg["output_dir"],
             help="Folder lưu JSON keyword.",
+            key="kw_output_dir",
         )
 
         stopwords_path = st.text_input(
             "Vietnamese stopwords path",
             value=cfg["stopwords_path"],
+            key="kw_stopwords_path",
         )
 
     with col2:
@@ -306,9 +214,13 @@ with tab1:
             key="kw_recursive",
         )
 
-        check_btn = st.button("Check input files")
+        check_btn = st.button("Check input files", key="kw_check_input")
 
-    show_model_config = st.checkbox("Show model config", value=False, key="kw_show_model_config")
+    show_model_config = st.checkbox(
+        "Show model config",
+        value=False,
+        key="kw_show_model_config",
+    )
 
     if show_model_config:
         st.subheader("Model config")
@@ -316,11 +228,13 @@ with tab1:
         ner_model_name = st.text_input(
             "NER model",
             value=cfg["ner_model_name"],
+            key="kw_ner_model_name",
         )
 
         sbert_model_name = st.text_input(
             "SBERT model",
             value=cfg["sbert_model_name"],
+            key="kw_sbert_model_name",
         )
     else:
         ner_model_name = cfg["ner_model_name"]
@@ -339,7 +253,12 @@ with tab1:
     }
 
     st.session_state["kw_config"] = new_cfg
-    cmd = build_keyword_command(new_cfg)
+
+    cmd_cfg = {
+        **new_cfg,
+        "verbose": st.session_state.get("global_verbose", True),
+    }
+    cmd = build_keyword_command(cmd_cfg)
     st.session_state["keyword_cmd"] = cmd
 
     st.divider()
@@ -354,12 +273,7 @@ with tab1:
 
     if files:
         st.success(f"Found {len(files)} .txt file(s)")
-        df = pd.DataFrame({
-            "file": [str(p) for p in files[:200]],
-            "name": [p.name for p in files[:200]],
-            "size_bytes": [p.stat().st_size if p.exists() else None for p in files[:200]],
-        })
-        st.dataframe(df, use_container_width=True)
+        render_file_table(files)
     else:
         st.info("Click 'Check input files' để kiểm tra input.")
 
@@ -372,8 +286,9 @@ with tab1:
         "Run Keyword Extraction",
         type="primary",
         use_container_width=True,
+        key="kw_run",
     )
-    
+
     if run_btn:
         if input_mode == UPLOAD_FILE_MODE and not uploaded_input_path:
             st.error("Bạn chưa upload file .txt.")
@@ -385,7 +300,7 @@ with tab1:
         try:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-            for line in run_command_stream(cmd):
+            for line in run_command_stream(cmd, cwd=PROJECT_DIR):
                 logs += line
                 log_box.code(logs[-8000:], language="text")
 
@@ -397,7 +312,7 @@ with tab1:
                 log_box.code(logs[-8000:], language="text")
 
 
-with tab2:
+def render_build_queries_tab():
     st.header("2. Build Queries")
 
     st.markdown("Bước này tương ứng command:")
@@ -405,7 +320,7 @@ with tab2:
     st.code(
         """python -m lib.web.build_query \\
   --input_dir ./keyword \\
-  --output_dir ./queries_lite \\
+  --output_dir ./queries \\
   --recursive \\
   --src_lang vi \\
   --tgt_lang zh \\
@@ -419,92 +334,58 @@ with tab2:
         language="bash",
     )
 
-    kw_cfg = st.session_state["kw_config"]
+    keyword_input_dir = st.session_state["kw_config"]["output_dir"]
+    query_defaults = make_query_defaults(keyword_input_dir)
+    previous_query_cfg = st.session_state.get("query_config", {})
 
-    default_keyword_dir = kw_cfg["output_dir"]
-    default_run_root = Path(default_keyword_dir).parent
+    if previous_query_cfg.get("keyword_input_dir") != keyword_input_dir:
+        for k in [
+            "query_output_dir",
+            "query_translation_cache_dir",
+        ]:
+            st.session_state.pop(k, None)
 
-    default_query_cfg = {
-        "query_input_mode": "Keyword directory",
-        "keyword_input_dir": default_keyword_dir,
-        "keyword_path": "",
-        "query_output_dir": str(default_run_root / "queries_lite"),
-        "query_output_path": str(default_run_root / "query.json"),
-        "translation_cache_dir": str(default_run_root / "cache/translation"),
-        "recursive": True,
-        "verbose": True,
-        "translate_gemini": True,
-        "gemini_model_name": "models/gemini-2.5-pro",
-        "translation_batch_size": 50,
-        "use_wikisource_rerank": True,
-        "wikisource_rerank_scope": "all",
-        "wikisource_rerank_top_k": 7,
-        "anchor_only": True,
-        "use_local_query": False,
-        "min_total_query": 4,
-        "top_n_keywords": 15,
-        "rarity_bias": 0.2,
-        "num_query_terms": 6,
-        "num_exact_anchors": 3,
-        "allow_semantic_fallback_terms": False,
-        "use_site_restriction": False,
-        "sites": "zh.wikisource.org,ctext.org",
-    }
+        previous_query_cfg = {}
 
     query_cfg_prev = {
-        **default_query_cfg,
-        **st.session_state.get("query_config", {}),
+        **query_defaults,
+        **previous_query_cfg,
+        "keyword_input_dir": keyword_input_dir, 
     }
+
+    default_run_root = Path(keyword_input_dir).parent
 
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        query_input_mode = st.radio(
-            "Query input mode",
-            ["Keyword directory", "Single keyword JSON"],
-            horizontal=True,
-            index=0 if query_cfg_prev.get("query_input_mode") == "Keyword directory" else 1,
+        st.markdown("**Keyword input directory**")
+        st.code(keyword_input_dir, language="text")
+        st.caption("Tự động lấy từ Keyword output directory của Tab 1.")
+
+        query_output_dir = st.text_input(
+            "Query output directory",
+            value=query_cfg_prev.get(
+                "query_output_dir",
+                str(default_run_root / "queries"),
+            ),
+            key="query_output_dir",
         )
-
-        if query_input_mode == "Keyword directory":
-            keyword_input_dir = st.session_state["kw_config"]["output_dir"]
-            st.text_input(
-                "Keyword input directory",
-                value=keyword_input_dir,
-                disabled=True,
-            )
-            keyword_path = query_cfg_prev.get("keyword_path", "")
-
-            query_output_dir = st.text_input(
-                "Query output directory",
-                value=query_cfg_prev.get("query_output_dir", str(default_run_root / "queries_lite")),
-            )
-            query_output_path = query_cfg_prev.get("query_output_path", str(default_run_root / "query.json"))
-
-        else:
-            keyword_path = st.text_input(
-                "Keyword JSON path",
-                value=query_cfg_prev.get("keyword_path", ""),
-            )
-            keyword_input_dir = query_cfg_prev.get("keyword_input_dir", default_keyword_dir)
-
-            query_output_path = st.text_input(
-                "Query output JSON path",
-                value=query_cfg_prev.get("query_output_path", str(default_run_root / "query.json")),
-            )
-            query_output_dir = query_cfg_prev.get("query_output_dir", str(default_run_root / "queries"))
 
         translation_cache_dir = st.text_input(
             "Translation cache directory",
-            value=query_cfg_prev.get("translation_cache_dir", str(default_run_root / "cache/translation")),
+            value=query_cfg_prev.get(
+                "translation_cache_dir",
+                str(default_run_root / "cache/translation"),
+            ),
+            key="query_translation_cache_dir",
         )
 
     with col2:
-        check_kw_btn = st.button("Check keyword JSON files")
+        check_kw_btn = st.button("Check keyword JSON files", key="query_check_keyword_json")
 
     st.subheader("Query planning")
 
-    col_plan1, col_plan2, col_plan3 = st.columns(3)
+    col_plan1, col_plan2 = st.columns(2)
 
     with col_plan1:
         anchor_only = st.checkbox(
@@ -528,6 +409,16 @@ with tab2:
             value=int(query_cfg_prev.get("min_total_query", 4)),
             step=1,
             help="Nếu số query groups chưa đủ, build_query sẽ thêm global_variant_*.",
+            key="query_min_total_query",
+        )
+
+        rarity_bias = st.number_input(
+            "Rarity bias",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(query_cfg_prev.get("rarity_bias", 0.2)),
+            step=0.05,
+            key="query_rarity_bias",
         )
 
     with col_plan2:
@@ -537,6 +428,7 @@ with tab2:
             max_value=100,
             value=int(query_cfg_prev.get("top_n_keywords", 15)),
             step=1,
+            key="query_top_n_keywords",
         )
 
         num_query_terms = st.number_input(
@@ -545,6 +437,7 @@ with tab2:
             max_value=30,
             value=int(query_cfg_prev.get("num_query_terms", 6)),
             step=1,
+            key="query_num_query_terms",
         )
 
         num_exact_anchors = st.number_input(
@@ -553,109 +446,122 @@ with tab2:
             max_value=20,
             value=int(query_cfg_prev.get("num_exact_anchors", 3)),
             step=1,
+            key="query_num_exact_anchors",
         )
 
-    with col_plan3:
-        rarity_bias = st.number_input(
-            "Rarity bias",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(query_cfg_prev.get("rarity_bias", 0.2)),
-            step=0.05,
+    st.subheader("Translation")
+
+    translate_gemini = st.checkbox(
+        "Translate Gemini",
+        value=query_cfg_prev.get("translate_gemini", True),
+        key="query_translate_gemini",
+    )
+
+    if translate_gemini:
+        col_t1, col_t2 = st.columns(2)
+
+        with col_t1:
+            translation_batch_size = st.number_input(
+                "Translation batch size",
+                min_value=1,
+                max_value=200,
+                value=int(query_cfg_prev.get("translation_batch_size", 50)),
+                step=1,
+                key="query_translation_batch_size",
+            )
+
+        with col_t2:
+            gemini_model_name = st.text_input(
+                "Gemini model name",
+                value=query_cfg_prev.get("gemini_model_name", "models/gemini-2.5-pro"),
+                key="query_gemini_model_name",
+            )
+    else:
+        translation_batch_size = int(query_cfg_prev.get("translation_batch_size", 50))
+        gemini_model_name = query_cfg_prev.get("gemini_model_name", "models/gemini-2.5-pro")
+
+        st.info(
+            "Gemini translation is disabled. build_query will use translation cache only."
         )
 
-        allow_semantic_fallback_terms = st.checkbox(
-            "Allow semantic fallback terms",
-            value=query_cfg_prev.get("allow_semantic_fallback_terms", False),
-            key="query_allow_semantic_fallback_terms",
+    st.subheader("Wikisource rerank")
+
+    use_wikisource_rerank = st.checkbox(
+        "Use Wikisource rerank",
+        value=query_cfg_prev.get("use_wikisource_rerank", True),
+        key="query_use_wikisource_rerank",
+    )
+
+    if use_wikisource_rerank:
+        col_w1, col_w2 = st.columns(2)
+
+        with col_w1:
+            wikisource_rerank_scope = st.selectbox(
+                "Wikisource rerank scope",
+                ["global", "all"],
+                index=1 if query_cfg_prev.get("wikisource_rerank_scope", "all") == "all" else 0,
+                key="query_wikisource_rerank_scope",
+            )
+
+        with col_w2:
+            wikisource_rerank_top_k = st.number_input(
+                "Wikisource rerank top K",
+                min_value=1,
+                max_value=30,
+                value=int(query_cfg_prev.get("wikisource_rerank_top_k", 7)),
+                step=1,
+                key="query_wikisource_rerank_top_k",
+            )
+
+    else:
+        wikisource_rerank_scope = query_cfg_prev.get("wikisource_rerank_scope", "all")
+        wikisource_rerank_top_k = int(query_cfg_prev.get("wikisource_rerank_top_k", 7))
+
+        st.info(
+            "Wikisource rerank is disabled. build_query will use semantic keyword ranking."
         )
 
-    st.subheader("Translation / Wikisource rerank")
+    st.subheader("Site restriction")
 
-    col_r1, col_r2, col_r3 = st.columns(3)
+    use_site_restriction = st.checkbox(
+        "Use site restriction",
+        value=query_cfg_prev.get("use_site_restriction", False),
+        key="query_use_site_restriction",
+    )
 
-    with col_r1:
-        translate_gemini = st.checkbox(
-            "Translate Gemini",
-            value=query_cfg_prev.get("translate_gemini", True),
-            key="query_translate_gemini",
-        )
-
-        translation_batch_size = st.number_input(
-            "Translation batch size",
-            min_value=1,
-            max_value=200,
-            value=int(query_cfg_prev.get("translation_batch_size", 50)),
-            step=1,
-        )
-
-    with col_r2:
-        use_wikisource_rerank = st.checkbox(
-            "Use Wikisource rerank",
-            value=query_cfg_prev.get("use_wikisource_rerank", True),
-            key="query_use_wikisource_rerank",
-        )
-
-        wikisource_rerank_scope = st.selectbox(
-            "Wikisource rerank scope",
-            ["global", "all"],
-            index=1 if query_cfg_prev.get("wikisource_rerank_scope", "all") == "all" else 0,
-        )
-
-    with col_r3:
-        wikisource_rerank_top_k = st.number_input(
-            "Wikisource rerank top K",
-            min_value=1,
-            max_value=30,
-            value=int(query_cfg_prev.get("wikisource_rerank_top_k", 7)),
-            step=1,
-        )
-
-    show_advanced_query = st.checkbox("Show advanced query options", value=False, key="query_show_advanced")
-    if show_advanced_query:
-        gemini_model_name = st.text_input(
-            "Gemini model name",
-            value=query_cfg_prev.get("gemini_model_name", "models/gemini-2.5-pro"),
-        )
-
-        use_site_restriction = st.checkbox(
-            "Use site restriction",
-            value=query_cfg_prev.get("use_site_restriction", False),
-            key="query_use_site_restriction",
-        )
-
+    if use_site_restriction:
         sites = st.text_input(
             "Sites, comma-separated",
             value=query_cfg_prev.get("sites", "zh.wikisource.org,ctext.org"),
+            key="query_sites",
+            help="Ví dụ: zh.wikisource.org,ctext.org",
         )
     else:
-        gemini_model_name = query_cfg_prev.get("gemini_model_name", "models/gemini-2.5-pro")
-        use_site_restriction = query_cfg_prev.get("use_site_restriction", False)
         sites = query_cfg_prev.get("sites", "zh.wikisource.org,ctext.org")
 
     query_cfg = {
-        "query_input_mode": query_input_mode,
         "keyword_input_dir": keyword_input_dir,
-        "keyword_path": keyword_path,
         "query_output_dir": query_output_dir,
-        "query_output_path": query_output_path,
         "translation_cache_dir": translation_cache_dir,
-        "recursive": True,
         "verbose": st.session_state.get("global_verbose", True),
+
         "translate_gemini": translate_gemini,
         "gemini_model_name": gemini_model_name,
         "translation_batch_size": int(translation_batch_size),
+
         "use_wikisource_rerank": use_wikisource_rerank,
         "wikisource_rerank_scope": wikisource_rerank_scope,
         "wikisource_rerank_top_k": int(wikisource_rerank_top_k),
+
         "anchor_only": anchor_only,
         "use_local_query": use_local_query,
         "min_total_query": int(min_total_query),
+
         "top_n_keywords": int(top_n_keywords),
         "rarity_bias": float(rarity_bias),
         "num_query_terms": int(num_query_terms),
         "num_exact_anchors": int(num_exact_anchors),
-        "allow_semantic_fallback_terms": allow_semantic_fallback_terms,
+
         "use_site_restriction": use_site_restriction,
         "sites": sites,
     }
@@ -669,22 +575,11 @@ with tab2:
     st.subheader("Keyword JSON check")
 
     if check_kw_btn:
-        if query_input_mode == "Single keyword JSON":
-            p = Path(keyword_path)
-            keyword_files = [p] if p.exists() and p.suffix.lower() == ".json" else []
-        else:
-            keyword_files = collect_keyword_json_files(keyword_input_dir, recursive=True)
+        keyword_files = collect_json_files(keyword_input_dir, recursive=True)
 
         if keyword_files:
             st.success(f"Found {len(keyword_files)} keyword JSON file(s).")
-            st.dataframe(
-                pd.DataFrame({
-                    "file": [str(p) for p in keyword_files[:200]],
-                    "name": [p.name for p in keyword_files[:200]],
-                    "size_bytes": [p.stat().st_size if p.exists() else None for p in keyword_files[:200]],
-                }),
-                use_container_width=True,
-            )
+            render_file_table(keyword_files)
         else:
             st.warning("No keyword JSON found.")
 
@@ -697,6 +592,7 @@ with tab2:
         "Run Build Query",
         type="primary",
         use_container_width=True,
+        key="query_run",
     )
 
     if run_query_btn:
@@ -704,12 +600,9 @@ with tab2:
         logs = ""
 
         try:
-            if query_input_mode == "Single keyword JSON":
-                Path(query_output_path).parent.mkdir(parents=True, exist_ok=True)
-            else:
-                Path(query_output_dir).mkdir(parents=True, exist_ok=True)
+            Path(query_output_dir).mkdir(parents=True, exist_ok=True)
 
-            for line in run_command_stream(query_cmd):
+            for line in run_command_stream(query_cmd, cwd=PROJECT_DIR):
                 logs += line
                 log_box.code(logs[-8000:], language="text")
 
@@ -721,6 +614,336 @@ with tab2:
                 log_box.code(logs[-8000:], language="text")
 
 
-with tab3:
-    st.header("3. Query Viewer")
-    st.info("Tab sau sẽ đọc query JSON trong queries_lite và hiển thị query/query_terms/exact_terms.")
+def render_search_crawl_tab():
+    st.header("3. Search / Crawl")
+
+    query_dir = st.session_state.get("query_config", {}).get(
+        "query_output_dir",
+        str(PROJECT_DIR / "queries"),
+    )
+
+    search_defaults = make_search_crawl_defaults(query_dir)
+    previous_cfg = st.session_state.get("search_crawl_config", {})
+
+    if previous_cfg.get("query_dir") != query_dir:
+        for k in ["sc_url_dir", "sc_page_dir"]:
+            st.session_state.pop(k, None)
+        previous_cfg = {}
+
+    cfg_prev = {
+        **search_defaults,
+        **previous_cfg,
+        "query_dir": query_dir,
+    }
+
+    st.subheader("Paths")
+
+    st.markdown("**Query input directory**")
+    st.code(query_dir, language="text")
+    st.caption("Tự động lấy từ Query output directory của Tab 2.")
+
+    col_path1, col_path2 = st.columns(2)
+
+    with col_path1:
+        url_dir = st.text_input(
+            "URL output directory",
+            value=cfg_prev.get("url_dir", search_defaults["url_dir"]),
+            key="sc_url_dir",
+        )
+
+    with col_path2:
+        page_dir = st.text_input(
+            "Pages output directory",
+            value=cfg_prev.get("page_dir", search_defaults["page_dir"]),
+            key="sc_page_dir",
+        )
+
+    st.subheader("Search config")
+
+    col_s1, col_s2, col_s3 = st.columns(3)
+
+    with col_s1:
+        search_backend = st.selectbox(
+            "Search backend",
+            ["serper"],
+            index=0,
+            key="sc_search_backend",
+        )
+    with col_s2:
+        num_results = st.number_input(
+            "Num results",
+            min_value=1,
+            max_value=50,
+            value=int(cfg_prev.get("num_results", 10)),
+            step=1,
+            key="sc_num_results",
+        )
+
+    with col_s3:
+        early_stop_url_count = st.number_input(
+            "Early stop URL count",
+            min_value=1,
+            max_value=20,
+            value=int(cfg_prev.get("early_stop_url_count", 3)),
+            step=1,
+            key="sc_early_stop_url_count",
+        )
+
+    include_omitted = st.checkbox(
+        "Include omitted results",
+        value=bool(cfg_prev.get("include_omitted", True)),
+        key="sc_include_omitted",
+    )
+
+    st.subheader("Crawl config")
+
+    col_c1, col_c2, col_c3 = st.columns(3)
+
+    with col_c1:
+        sleep_min = st.number_input(
+            "Sleep min",
+            min_value=0.0,
+            max_value=60.0,
+            value=float(cfg_prev.get("sleep_min", 3.0)),
+            step=0.5,
+            key="sc_sleep_min",
+        )
+
+        sleep_max = st.number_input(
+            "Sleep max",
+            min_value=0.0,
+            max_value=120.0,
+            value=float(cfg_prev.get("sleep_max", 6.0)),
+            step=0.5,
+            key="sc_sleep_max",
+        )
+
+    with col_c2:
+        timeout = st.number_input(
+            "Timeout",
+            min_value=5,
+            max_value=120,
+            value=int(cfg_prev.get("timeout", 20)),
+            step=1,
+            key="sc_timeout",
+        )
+
+        min_text_len = st.number_input(
+            "Min text len",
+            min_value=0,
+            max_value=5000,
+            value=int(cfg_prev.get("min_text_len", 200)),
+            step=50,
+            key="sc_min_text_len",
+        )
+
+    with col_c3:
+        collect_assets = st.checkbox(
+            "Collect assets",
+            value=bool(cfg_prev.get("collect_assets", True)),
+            key="sc_collect_assets",
+        )
+
+    search_crawl_cfg = {
+        "query_dir": query_dir,
+        "url_dir": url_dir,
+        "page_dir": page_dir,
+
+        "search_backend": search_backend,
+        "num_results": int(num_results),
+        "include_omitted": bool(include_omitted),
+        "early_stop_url_count": int(early_stop_url_count),
+
+        "sleep_min": float(sleep_min),
+        "sleep_max": float(sleep_max),
+        "timeout": int(timeout),
+        "min_text_len": int(min_text_len),
+        "collect_assets": bool(collect_assets),
+
+        "verbose": st.session_state.get("global_verbose", True),
+    }
+
+    st.session_state["search_crawl_config"] = search_crawl_cfg
+
+    search_cmd = build_search_command(search_crawl_cfg)
+    crawl_cmd = build_crawl_command(search_crawl_cfg)
+
+    st.session_state["search_cmd"] = search_cmd
+    st.session_state["crawl_cmd"] = crawl_cmd
+
+    st.divider()
+
+    st.subheader("Command preview")
+
+    st.markdown("**Search command**")
+    st.code(shell_command(search_cmd), language="bash")
+
+    st.markdown("**Crawl command**")
+    st.code(shell_command(crawl_cmd), language="bash")
+
+    col_check, col_search, col_crawl, col_all = st.columns([1, 1, 1, 1.2])
+
+    with col_check:
+        check_query_btn = st.button(
+            "Check query JSON",
+            use_container_width=True,
+            key="sc_check_query_json",
+        )
+
+    with col_search:
+        run_search_btn = st.button(
+            "Run Search only",
+            use_container_width=True,
+            key="sc_run_search_only",
+        )
+
+    with col_crawl:
+        run_crawl_btn = st.button(
+            "Run Crawl only",
+            use_container_width=True,
+            key="sc_run_crawl_only",
+        )
+
+    with col_all:
+        run_all_btn = st.button(
+            "Run Search + Crawl",
+            type="primary",
+            use_container_width=True,
+            key="sc_run_all",
+        )
+
+    if check_query_btn:
+        query_files = collect_json_files(query_dir, recursive=True)
+
+        if query_files:
+            st.success(f"Found {len(query_files)} query JSON file(s).")
+            render_file_table(query_files)
+        else:
+            st.warning("No query JSON found. Run Tab 2 first.")
+
+    if run_search_btn:
+        query_files = collect_json_files(query_dir, recursive=True)
+        if not query_files:
+            st.error("No query JSON found. Run Tab 2 first.")
+            st.stop()
+
+        log_box = st.empty()
+        logs = "Starting Search URLs...\n"
+        log_box.code(logs, language="text")
+
+        try:
+            Path(url_dir).mkdir(parents=True, exist_ok=True)
+
+            for line in run_command_stream(search_cmd, cwd=PROJECT_DIR):
+                logs += line
+                log_box.code(logs[-12000:], language="text")
+
+            st.success("Search URLs finished.")
+
+            url_files = collect_json_files(url_dir, recursive=True)
+            if url_files:
+                st.info(f"URL JSON files: {len(url_files)}")
+
+        except Exception as e:
+            st.error(str(e))
+            if logs:
+                log_box.code(logs[-12000:], language="text")
+
+    if run_crawl_btn:
+        if sleep_max < sleep_min:
+            st.error("Sleep max phải >= Sleep min.")
+            st.stop()
+
+        url_files = collect_json_files(url_dir, recursive=True)
+        if not url_files:
+            st.error("No URL JSON found. Run Search only first.")
+            st.stop()
+
+        log_box = st.empty()
+        logs = "Starting Fetch Pages...\n"
+        log_box.code(logs, language="text")
+
+        try:
+            Path(page_dir).mkdir(parents=True, exist_ok=True)
+
+            for line in run_command_stream(crawl_cmd, cwd=PROJECT_DIR):
+                logs += line
+                log_box.code(logs[-12000:], language="text")
+
+            st.success("Fetch pages finished.")
+
+        except Exception as e:
+            st.error(str(e))
+            if logs:
+                log_box.code(logs[-12000:], language="text")
+
+    if run_all_btn:
+        if sleep_max < sleep_min:
+            st.error("Sleep max phải >= Sleep min.")
+            st.stop()
+
+        query_files = collect_json_files(query_dir, recursive=True)
+        if not query_files:
+            st.error("No query JSON found. Run Tab 2 first.")
+            st.stop()
+
+        log_box = st.empty()
+        logs = "Starting Search URLs...\n"
+        log_box.code(logs, language="text")
+
+        try:
+            Path(url_dir).mkdir(parents=True, exist_ok=True)
+            Path(page_dir).mkdir(parents=True, exist_ok=True)
+
+            for line in run_command_stream(search_cmd, cwd=PROJECT_DIR):
+                logs += line
+                log_box.code(logs[-12000:], language="text")
+
+            logs += "\nSearch finished. Starting Fetch Pages...\n"
+            log_box.code(logs[-12000:], language="text")
+
+            for line in run_command_stream(crawl_cmd, cwd=PROJECT_DIR):
+                logs += line
+                log_box.code(logs[-12000:], language="text")
+
+            st.success("Search + Crawl finished.")
+
+        except Exception as e:
+            st.error(str(e))
+            if logs:
+                log_box.code(logs[-12000:], language="text")
+
+def main():
+    init_state()
+
+    st.title("Quốc ngữ → Hán Pipeline UI")
+    st.caption("v2 — Keyword Extraction → Build Queries → Search / Crawl")
+
+    st.sidebar.header("Global settings")
+
+    st.sidebar.checkbox(
+        "Verbose logs",
+        value=st.session_state.get("global_verbose", True),
+        key="global_verbose",
+    )
+
+    st.sidebar.caption(f"Project dir: `{PROJECT_DIR}`")
+
+    tab1, tab2, tab3 = st.tabs([
+        "1. Keyword Extraction",
+        "2. Build Queries",
+        "3. Search / Crawl",
+    ])
+
+    with tab1:
+        render_keyword_extraction_tab()
+
+    with tab2:
+        render_build_queries_tab()
+
+    with tab3:
+        render_search_crawl_tab()
+
+
+if __name__ == "__main__":
+    main()

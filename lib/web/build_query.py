@@ -31,7 +31,7 @@ from lib.translators import create_translator
 from lib.config import load_project_env, get_env
 
 REQUEST_SLEEP_RANGE = (0.25, 0.35)
-GROUP_SLEEP_RANGE = (0.5, 5.0)
+GROUP_SLEEP_RANGE = (0.5, 0.5)
 
 
 def has_wikisource_support(item: Dict[str, Any]) -> bool:
