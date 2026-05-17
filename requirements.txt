@@ -15,3 +15,5 @@ beautifulsoup4
 lxml
 pymupdf
 opencc-python-reimplemented
+py_vncorenlp
+streamlit

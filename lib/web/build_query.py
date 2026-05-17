@@ -3,7 +3,7 @@ Build web search queries from extracted keywords.
 
 Pipeline:
 1. Load keyword JSON.
-2. Build one global keyword group and several local keyword groups.
+2. Build one global keyword group, optional local keyword groups, or global variants.
 3. Translate keywords.
 4. Select Han anchors using Wikisource reranking.
 5. Build search queries.
@@ -31,7 +31,7 @@ from lib.translators import create_translator
 from lib.config import load_project_env, get_env
 
 REQUEST_SLEEP_RANGE = (0.25, 0.35)
-GROUP_SLEEP_RANGE = (0.5, 1.0)
+GROUP_SLEEP_RANGE = (0.5, 5.0)
 
 
 def has_wikisource_support(item: Dict[str, Any]) -> bool:
@@ -228,8 +228,12 @@ def build_queries_for_keyword_file(
         print(f"\n=== Building queries for {doc_id} ===")
         print(f"Keyword file: {keyword_path}")
         print(f"Chunks: {num_chunks}")
+        print(f"Use local query: {args.use_local_query}")
         
-    num_local_query = max(1, math.ceil(math.sqrt(num_chunks)))
+    if args.use_local_query:
+        num_local_query = max(1, math.ceil(math.sqrt(num_chunks)))
+    else:
+        num_local_query = 0
 
     chunk_keywords_for_agg = [
         [
@@ -262,32 +266,37 @@ def build_queries_for_keyword_file(
     })
 
     # =========================================================================
-    # 2. LOCAL QUERY GROUPS
+    # 2. OPTIONAL LOCAL QUERY GROUPS
     # =========================================================================
-    for i in range(num_local_query):
-        start_idx = math.floor(i * num_chunks / num_local_query)
-        end_idx = math.floor((i + 1) * num_chunks / num_local_query)
+    if args.use_local_query:
+        for i in range(num_local_query):
+            start_idx = math.floor(i * num_chunks / num_local_query)
+            end_idx = math.floor((i + 1) * num_chunks / num_local_query)
 
-        if start_idx >= end_idx:
-            continue
+            if start_idx >= end_idx:
+                continue
 
-        sub_chunk_keywords = chunk_keywords_for_agg[start_idx:end_idx]
+            sub_chunk_keywords = chunk_keywords_for_agg[start_idx:end_idx]
 
-        local_kws = VnKeywordExtractor.aggregate(
-            sub_chunk_keywords,
-            top_n=args.top_n_keywords,
-            rarity_bias=args.rarity_bias,
-        )
+            local_kws = VnKeywordExtractor.aggregate(
+                sub_chunk_keywords,
+                top_n=args.top_n_keywords,
+                rarity_bias=args.rarity_bias,
+            )
 
-        results.append({
-            "query_id": f"local_{i}",
-            "start_chunk_idx": start_idx,
-            "end_chunk_idx": end_idx - 1,
-            "keywords": keyword_tuples_to_dicts(local_kws),
-        })
+            results.append({
+                "query_id": f"local_{i}",
+                "start_chunk_idx": start_idx,
+                "end_chunk_idx": end_idx - 1,
+                "keywords": keyword_tuples_to_dicts(local_kws),
+            })
+    elif args.verbose:
+        print("Local query groups disabled; using global variants to reach min_total_query")
 
     # =========================================================================
-    # 2.1. GLOBAL VARIANTS FOR SMALL DOCUMENTS
+    # 2.1. GLOBAL VARIANTS
+    #      - If local queries are enabled, this only pads small documents.
+    #      - If local queries are disabled, this becomes the main variant source.
     # =========================================================================
     missing_query_count = max(0, args.min_total_query - len(results))
 
@@ -505,6 +514,7 @@ def build_queries_for_keyword_file(
         "doc_id": doc_id,
         "source_keyword_path": str(keyword_path),
         "num_chunks": num_chunks,
+        "use_local_query": args.use_local_query,
         "num_local_query": num_local_query,
         "num_query_groups": len(results),
         "min_total_query": args.min_total_query,
@@ -566,6 +576,15 @@ def main():
         type=int,
         default=4,
         help="Minimum number of query groups per document, including global query",
+    )
+    parser.add_argument(
+        "--use_local_query",
+        action="store_true",
+        help=(
+            "Enable local query groups built from chunk ranges. "
+            "If not set, local groups are disabled and global_variant_* "
+            "queries are generated from the global keyword pool instead."
+        ),
     )
     parser.add_argument(
         "--num_query_terms",
