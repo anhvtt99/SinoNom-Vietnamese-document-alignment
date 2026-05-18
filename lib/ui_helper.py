@@ -1,3 +1,4 @@
+import json
 import shlex
 import subprocess
 import shutil
@@ -322,11 +323,116 @@ def copy_matched_files(input_dir: str, names: set[str], out_dir: Path) -> int:
 
     return copied
 
+def _walk_values(obj):
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk_values(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_values(v)
+    else:
+        yield obj
+
+
+def _extract_url_from_json(obj) -> str:
+    """Best-effort URL extraction from page/search JSON files."""
+    preferred_keys = [
+        "target_link",
+        "source_url",
+        "final_url",
+        "canonical_url",
+        "url",
+        "link",
+    ]
+
+    def scan(x) -> str:
+        if isinstance(x, dict):
+            for k in preferred_keys:
+                v = x.get(k)
+                if isinstance(v, str) and v.startswith(("http://", "https://")):
+                    return v
+            for v in x.values():
+                found = scan(v)
+                if found:
+                    return found
+        elif isinstance(x, list):
+            for item in x:
+                found = scan(item)
+                if found:
+                    return found
+        elif isinstance(x, str) and x.startswith(("http://", "https://")):
+            return x
+        return ""
+
+    return scan(obj)
+
+
+def build_target_link_map(page_dir: str | Path) -> dict[str, str]:
+    """
+    Best-effort mapping from target identifiers to original URL.
+    Works with common page JSON fields: url, link, source_url, final_url, etc.
+    """
+    root = Path(page_dir)
+    out: dict[str, str] = {}
+
+    if not root.exists():
+        return out
+
+    for p in root.rglob("*.json"):
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+
+        url = _extract_url_from_json(obj)
+        if not url:
+            continue
+
+        keys = set(key_variants(p.name)) | set(key_variants(p.stem))
+
+        if isinstance(obj, dict):
+            for key in ["output_name", "txt_name", "file_name", "filename", "title", "id"]:
+                v = obj.get(key)
+                if isinstance(v, str) and v.strip():
+                    keys.update(key_variants(v))
+
+        for v in _walk_values(obj):
+            if isinstance(v, str) and (v.endswith(".txt") or v.endswith(".json")):
+                keys.update(key_variants(v))
+
+        for k in keys:
+            out[k] = url
+
+    return out
+
+
+def add_target_link_column(df: pd.DataFrame, *, page_dir: str | Path | None = None) -> pd.DataFrame:
+    if "target_link" in df.columns:
+        return df
+
+    df = df.copy()
+    link_map = build_target_link_map(page_dir) if page_dir else {}
+
+    def lookup_link(tar_idx) -> str:
+        for k in key_variants(str(tar_idx)):
+            if k in link_map:
+                return link_map[k]
+        return ""
+
+    if "tar_idx" in df.columns:
+        df["target_link"] = df["tar_idx"].map(lookup_link)
+    else:
+        df["target_link"] = ""
+
+    return df
+
+
 def make_alignment_result_package(
     *,
     align_output_dir: str,
     vi_input_dir: str,
     txt_output_dir: str,
+    page_dir: str | None = None,
     result_dir_name: str = "result",
 ) -> Path:
     align_output = Path(align_output_dir)
@@ -349,13 +455,13 @@ def make_alignment_result_package(
     tar_dir.mkdir(parents=True, exist_ok=True)
 
     result_tsv = result_dir / "aligner_result.tsv"
-    shutil.copy2(latest_tsv, result_tsv)
 
     df = pd.read_csv(latest_tsv, sep="\t")
+    df = add_target_link_column(df, page_dir=page_dir)
+    df.to_csv(result_tsv, sep="\t", index=False)
 
     src_names = set(str(x) for x in df["src_idx"].dropna().tolist())
     tar_names = set(str(x) for x in df["tar_idx"].dropna().tolist())
-
 
     n_src = copy_matched_files(vi_input_dir, src_names, src_dir)
     n_tar = copy_matched_files(txt_output_dir, tar_names, tar_dir)

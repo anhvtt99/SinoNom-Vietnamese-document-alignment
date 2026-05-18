@@ -100,6 +100,7 @@ class Candidate:
 
     text: str
     text_len: int
+    text_bytes: int
     han_chars: int
     latin_chars: int
     han_ratio: float
@@ -772,6 +773,7 @@ def page_to_candidate(
     min_han_chars: int,
     min_han_ratio: float,
     max_text_chars: Optional[int],
+    max_file_size: Optional[int],
     skip_ocr: bool,
     annotation_mode: str,
     unicode_form: str,
@@ -824,6 +826,24 @@ def page_to_candidate(
 
     if max_text_chars is not None and max_text_chars > 0:
         text = text[:max_text_chars].strip()
+
+    text_bytes = len(text.encode("utf-8"))
+
+    if max_file_size is not None and max_file_size > 0 and text_bytes > max_file_size:
+        text_len_tmp = len(text)
+        han_tmp, latin_tmp, h_ratio_tmp, l_ratio_tmp = language_ratios(text)
+        return None, {
+            "page_id": page_id,
+            "reason": "file_too_large",
+            "url": url,
+            "text_len": text_len_tmp,
+            "text_bytes": text_bytes,
+            "max_file_size": max_file_size,
+            "han_chars": han_tmp,
+            "latin_chars": latin_tmp,
+            "han_ratio": h_ratio_tmp,
+            "latin_ratio": l_ratio_tmp,
+        }
 
     if drop_vertical_ocr:
         is_vertical, vertical_stats = is_vertical_ocr_text(
@@ -914,6 +934,7 @@ def page_to_candidate(
 
         text=text,
         text_len=text_len,
+        text_bytes=text_bytes,
         han_chars=han,
         latin_chars=latin,
         han_ratio=h_ratio,
@@ -963,6 +984,7 @@ def collect_candidates_from_file(
             min_han_chars=args.min_han_chars,
             min_han_ratio=args.min_han_ratio,
             max_text_chars=args.max_text_chars,
+            max_file_size=args.max_file_size,
             skip_ocr=not args.keep_ocr_needed,
             annotation_mode=args.annotation_mode,
             unicode_form=args.unicode_form,
@@ -1296,6 +1318,52 @@ def add_rejections_by_doc(
 # CLI
 # =============================================================================
 
+def parse_size_to_bytes(raw: Optional[str]) -> Optional[int]:
+    """
+    Parse human-friendly file size strings into bytes.
+
+    Accepted examples:
+        500000
+        500KB / 500K
+        2MB / 2M
+        1.5GB / 1.5G
+
+    Returns None when raw is empty/None.
+    """
+    if raw is None:
+        return None
+
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    m = re.fullmatch(r"(?i)\s*(\d+(?:\.\d+)?)\s*([kmgt]?b?|bytes?)?\s*", s)
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"Invalid file size: {raw!r}. Examples: 500000, 500KB, 2MB, 1.5GB"
+        )
+
+    value = float(m.group(1))
+    unit = (m.group(2) or "b").lower()
+
+    multiplier = {
+        "": 1,
+        "b": 1,
+        "byte": 1,
+        "bytes": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024 ** 2,
+        "mb": 1024 ** 2,
+        "g": 1024 ** 3,
+        "gb": 1024 ** 3,
+        "t": 1024 ** 4,
+        "tb": 1024 ** 4,
+    }[unit]
+
+    return int(value * multiplier)
+
+
 def parse_trusted_domains(raw: str) -> Set[str]:
     if not raw:
         return set()
@@ -1325,6 +1393,15 @@ def main() -> None:
         type=int,
         default=None,
         help="Optional cap for exported text length per page. Default: no cap.",
+    )
+    parser.add_argument(
+        "--max_file_size",
+        type=parse_size_to_bytes,
+        default=None,
+        help=(
+            "Drop a cleaned TXT candidate if its UTF-8 byte size is larger than this value. "
+            "Accepts bytes or units like 500KB, 2MB, 1.5GB. Default: no size filter."
+        ),
     )
     parser.add_argument(
         "--keep_ocr_needed",
@@ -1487,6 +1564,7 @@ def main() -> None:
         print(f"[*] Output dir:     {output_dir}")
         print(f"[*] JSON files:     {len(json_files)}")
         print(f"[*] min_han_ratio:  {args.min_han_ratio}")
+        print(f"[*] max_file_size:  {args.max_file_size}")
         print(f"[*] drop vertical:  {not args.keep_vertical_ocr}")
         print(f"[*] exact dedup:    {not args.disable_exact_dedup}")
         print(f"[*] near dedup:     {args.near_dedup}")
@@ -1572,6 +1650,7 @@ def main() -> None:
             "min_han_chars": args.min_han_chars,
             "min_han_ratio": args.min_han_ratio,
             "max_text_chars": args.max_text_chars,
+            "max_file_size": args.max_file_size,
             "skip_ocr": not args.keep_ocr_needed,
             "drop_vertical_ocr": not args.keep_vertical_ocr,
             "vertical_min_lines": args.vertical_min_lines,

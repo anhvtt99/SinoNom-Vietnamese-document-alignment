@@ -100,6 +100,9 @@ def make_export_embed_align_defaults(page_dir: str) -> dict:
         "use_tab1_vi_input": True,
         "vi_input_dir": get_tab1_vi_input_dir(),
 
+        # export clean TXT filter
+        "max_file_size": "5MB",
+
         # embedding + align
         "emb_base_path": str(run_root / "embeddings"),
         "align_output_dir": str(run_root / "align_results"),
@@ -208,15 +211,71 @@ def build_global_pipeline_configs() -> dict:
         "export_embed_align": export_embed_align_cfg,
     }
 
+
+def render_zip_download_button(*, label: str, path_key: str, file_name: str, button_key: str):
+    """Render download button from a persisted zip path in session_state."""
+    zip_path_value = st.session_state.get(path_key, "")
+    if not zip_path_value:
+        return
+
+    zip_path = Path(zip_path_value)
+    if not zip_path.exists():
+        st.warning(f"Download file not found: {zip_path}")
+        return
+
+    with zip_path.open("rb") as f:
+        st.download_button(
+            label,
+            data=f,
+            file_name=file_name,
+            mime="application/zip",
+            key=button_key,
+            use_container_width=True,
+        )
+
+
+def render_global_downloads():
+    result_zip_path = st.session_state.get("global_result_zip_path", "")
+    intermediate_zip_path = st.session_state.get("global_intermediate_zip_path", "")
+
+    if not result_zip_path and not intermediate_zip_path:
+        return
+
+    st.subheader("Downloads")
+    col_d1, col_d2 = st.columns(2)
+
+    with col_d1:
+        render_zip_download_button(
+            label="Download result.zip",
+            path_key="global_result_zip_path",
+            file_name="result.zip",
+            button_key="global_download_result_zip_persisted",
+        )
+
+    with col_d2:
+        render_zip_download_button(
+            label="Download intermediate_result.zip",
+            path_key="global_intermediate_zip_path",
+            file_name="intermediate_result.zip",
+            button_key="global_download_intermediate_zip_persisted",
+        )
+
+    result_dir_value = st.session_state.get("global_result_dir", "")
+    if result_dir_value:
+        result_dir = Path(result_dir_value)
+        if result_dir.exists():
+            result_files = sorted([p for p in result_dir.rglob("*") if p.is_file()])
+            if result_files:
+                st.subheader("Final result package")
+                render_file_table(result_files)
+
 def render_global_run_all():
-    st.sidebar.divider()
-    st.sidebar.subheader("Global pipeline")
+    st.header("0. Global Run All")
+    st.caption("Load all config from tabs and run the full pipeline.")
 
-    st.sidebar.caption(
-        "Load all config from tabs. "
-    )
+    render_global_downloads()
 
-    run_global_btn = st.sidebar.button(
+    run_global_btn = st.button(
         "Run ALL pipeline",
         type="primary",
         use_container_width=True,
@@ -338,43 +397,18 @@ def render_global_run_all():
             align_output_dir=eea_cfg["align_output_dir"],
             vi_input_dir=eea_cfg["vi_input_dir"],
             txt_output_dir=eea_cfg["txt_output_dir"],
+            page_dir=search_crawl_cfg["page_dir"],
         )
 
         result_zip = make_zip_from_dir(result_dir)
         intermediate_zip = make_zip_from_dir(INTERMEDIATE_DIR)
 
+        st.session_state["global_result_dir"] = str(result_dir)
+        st.session_state["global_result_zip_path"] = str(result_zip)
+        st.session_state["global_intermediate_zip_path"] = str(intermediate_zip)
+
         st.success("Global pipeline finished.")
-
-        st.subheader("Downloads")
-
-        col_d1, col_d2 = st.columns(2)
-
-        with col_d1:
-            with result_zip.open("rb") as f:
-                st.download_button(
-                    "Download result.zip",
-                    data=f,
-                    file_name="result.zip",
-                    mime="application/zip",
-                    key="global_download_result_zip",
-                    use_container_width=True,
-                )
-
-        with col_d2:
-            with intermediate_zip.open("rb") as f:
-                st.download_button(
-                    "Download intermediate_result.zip",
-                    data=f,
-                    file_name="intermediate_result.zip",
-                    mime="application/zip",
-                    key="global_download_intermediate_zip",
-                    use_container_width=True,
-                )
-
-        result_files = sorted([p for p in result_dir.rglob("*") if p.is_file()])
-        if result_files:
-            st.subheader("Final result package")
-            render_file_table(result_files)
+        render_global_downloads()
 
     except Exception as e:
         st.error(str(e))
@@ -411,6 +445,11 @@ def init_state():
     st.session_state.setdefault("query_cmd", [])
     st.session_state.setdefault("search_cmd", [])
     st.session_state.setdefault("crawl_cmd", [])
+    st.session_state.setdefault("global_result_dir", "")
+    st.session_state.setdefault("global_result_zip_path", "")
+    st.session_state.setdefault("global_intermediate_zip_path", "")
+    st.session_state.setdefault("eea_result_dir", "")
+    st.session_state.setdefault("eea_result_zip_path", "")
 
 
 def render_file_table(files: list[Path], max_rows: int = 200):
@@ -1195,6 +1234,13 @@ def render_search_crawl_tab():
 def render_export_embed_align_tab():
     st.header("4. Export / Embed / Align")
 
+    render_zip_download_button(
+        label="Download previous result ZIP",
+        path_key="eea_result_zip_path",
+        file_name="result.zip",
+        button_key="eea_download_previous_result_zip",
+    )
+
     page_dir = st.session_state.get("search_crawl_config", {}).get(
         "page_dir",
         str(INTERMEDIATE_DIR / "pages"),
@@ -1279,6 +1325,21 @@ def render_export_embed_align_tab():
             value=cfg_prev["align_output_dir"],
             key="eea_align_output_dir",
         )
+
+    st.subheader("Export clean TXT config")
+
+    max_file_size = st.text_input(
+        "Max exported TXT file size",
+        value=str(cfg_prev.get("max_file_size") or "5MB"),
+        help=(
+            "Remove candidate if TXT after is too large. "
+            "Ex: 500KB, 2MB, 5MB. "
+            "Empty = không giới hạn."
+        ),
+        key="eea_max_file_size",
+    )
+
+    max_file_size = max_file_size.strip() or None
 
     st.subheader("Shared split config")
 
@@ -1592,6 +1653,7 @@ def render_export_embed_align_tab():
                     align_output_dir=align_output_dir,
                     vi_input_dir=vi_input_dir,
                     txt_output_dir=txt_output_dir,
+                    page_dir=page_dir,
                 )
 
                 st.success(f"Alignment result package created: {result_dir}")
@@ -1602,15 +1664,15 @@ def render_export_embed_align_tab():
                     render_file_table(result_files)
 
                 zip_path = make_zip_from_dir(result_dir)
+                st.session_state["eea_result_dir"] = str(result_dir)
+                st.session_state["eea_result_zip_path"] = str(zip_path)
 
-                with zip_path.open("rb") as f:
-                    st.download_button(
-                        "Download result ZIP",
-                        data=f,
-                        file_name=zip_path.name,
-                        mime="application/zip",
-                        key="eea_download_result_zip",
-                    )
+                render_zip_download_button(
+                    label="Download result ZIP",
+                    path_key="eea_result_zip_path",
+                    file_name=zip_path.name,
+                    button_key="eea_download_result_zip_persisted",
+                )
 
             st.success("Done.")
 
@@ -1635,13 +1697,16 @@ def main():
 
     st.sidebar.caption(f"Project dir: `{PROJECT_DIR}`")
 
-    render_global_run_all()
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab0, tab1, tab2, tab3, tab4 = st.tabs([
+        "0. Global",
         "1. Keyword Extraction",
         "2. Build Queries",
         "3. Search / Crawl",
         "4. Export / Embed / Align",
     ])
+
+    with tab0:
+        render_global_run_all()
 
     with tab1:
         render_keyword_extraction_tab()
