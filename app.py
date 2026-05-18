@@ -10,8 +10,13 @@ from lib.ui_helper import (
     build_query_command,
     build_search_command,
     build_crawl_command,
+    build_export_clean_txt_command,
+    build_generate_embeddings_command,
+    build_aligner_command,
     collect_json_files,
     collect_txt_files,
+    make_alignment_result_package,
+    make_zip_from_dir,
     run_command_stream,
     shell_command,
 )
@@ -84,6 +89,64 @@ def make_search_crawl_defaults(query_output_dir: str) -> dict:
         "collect_assets": True,
     }
 
+def make_export_embed_align_defaults(page_dir: str) -> dict:
+    run_root = Path(page_dir).parent
+
+    return {
+        "page_dir": page_dir,
+        "txt_output_dir": str(run_root / "corpus_txt"),
+
+        # VI source TXT should usually be the original input dir from Tab 1
+        "use_tab1_vi_input": True,
+        "vi_input_dir": get_tab1_vi_input_dir(),
+
+        # embedding + align
+        "emb_base_path": str(run_root / "embeddings"),
+        "align_output_dir": str(run_root / "align_results"),
+
+        "embedding_model_name": "sentence-transformers/LaBSE",
+        "process_mode": "per_batch",
+        "batch_size": 768,
+        "encode_group_size": 4096,
+        "normalize_embeddings": True,
+
+        # shared split config
+        "split_mode": "sentence",
+        "num_of_sent": 8,
+        "overlap_sent": 2,
+        "max_sent_len": 10000,
+        "chunk_size": 100,
+        "overlap_rate": 0.5,
+        "max_tokens": None,
+
+        # aligner config
+        "align_mode": "1-1",
+        "top_k_chunks": 5,
+        "top_k_docs": 10,
+        "bimax_trim_ratio": 0.7,
+        "csls_k": 10,
+        "csls_top_k_out": 10,
+        "edge_threshold": 0.08,
+    }
+
+def get_tab1_vi_input_dir() -> str:
+    kw_cfg = st.session_state.get("kw_config", {})
+
+    if kw_cfg.get("input_mode") == UPLOAD_FILE_MODE:
+        uploaded_path = kw_cfg.get("uploaded_input_path", "")
+        if uploaded_path:
+            return str(Path(uploaded_path).parent)
+
+        return kw_cfg.get(
+            "upload_dir",
+            str(PROJECT_DIR / "ui_uploads"),
+        )
+
+    return kw_cfg.get(
+        "input_dir",
+        str(PROJECT_DIR / "data/In/Txt_Viet/Viet_chapters"),
+    )
+
 def init_state():
     if "kw_config" not in st.session_state:
         st.session_state["kw_config"] = make_keyword_defaults(PROJECT_DIR)
@@ -97,6 +160,19 @@ def init_state():
         st.session_state["search_crawl_config"] = make_search_crawl_defaults(
             st.session_state["query_config"]["query_output_dir"]
         )
+
+    if "export_embed_align_config" not in st.session_state:
+        page_dir = st.session_state.get("search_crawl_config", {}).get(
+            "page_dir",
+            str(PROJECT_DIR / "pages"),
+        )
+        st.session_state["export_embed_align_config"] = make_export_embed_align_defaults(page_dir)
+    
+    st.session_state.setdefault("export_cmd", [])
+    st.session_state.setdefault("embed_vi_cmd", [])
+    st.session_state.setdefault("embed_zh_cmd", [])
+    st.session_state.setdefault("align_cmd", [])
+    st.session_state.setdefault("align_cmd", [])
     st.session_state.setdefault("input_files", [])
     st.session_state.setdefault("keyword_cmd", [])
     st.session_state.setdefault("query_cmd", [])
@@ -118,19 +194,7 @@ def render_keyword_extraction_tab():
 
     cfg = st.session_state["kw_config"]
 
-    st.markdown("Bước này tương ứng command:")
-
-    st.code(
-        """python -m lib.web.VnKeywordExtractor \\
-  --input_dir ... \\
-  --output_dir ... \\
-  --ner_model_name ... \\
-  --sbert_model_name ... \\
-  --stopwords_path ... \\
-  --recursive \\
-  --verbose""",
-        language="bash",
-    )
+    st.subheader("Paths")
 
     col1, col2 = st.columns([2, 1])
 
@@ -315,24 +379,7 @@ def render_keyword_extraction_tab():
 def render_build_queries_tab():
     st.header("2. Build Queries")
 
-    st.markdown("Bước này tương ứng command:")
-
-    st.code(
-        """python -m lib.web.build_query \\
-  --input_dir ./keyword \\
-  --output_dir ./queries \\
-  --recursive \\
-  --src_lang vi \\
-  --tgt_lang zh \\
-  --translation_cache_dir ./cache/translation \\
-  --translate_gemini \\
-  --use_wikisource_rerank \\
-  --wikisource_rerank_scope all \\
-  --wikisource_rerank_top_k 7 \\
-  --anchor_only \\
-  --verbose""",
-        language="bash",
-    )
+    st.subheader("Paths")
 
     keyword_input_dir = st.session_state["kw_config"]["output_dir"]
     query_defaults = make_query_defaults(keyword_input_dir)
@@ -697,7 +744,7 @@ def render_search_crawl_tab():
 
     st.subheader("Crawl config")
 
-    col_c1, col_c2, col_c3 = st.columns(3)
+    col_c1, col_c2 = st.columns(2)
 
     with col_c1:
         sleep_min = st.number_input(
@@ -737,12 +784,11 @@ def render_search_crawl_tab():
             key="sc_min_text_len",
         )
 
-    with col_c3:
-        collect_assets = st.checkbox(
-            "Collect assets",
-            value=bool(cfg_prev.get("collect_assets", True)),
-            key="sc_collect_assets",
-        )
+    collect_assets = st.checkbox(
+        "Collect assets",
+        value=bool(cfg_prev.get("collect_assets", True)),
+        key="sc_collect_assets",
+    )
 
     search_crawl_cfg = {
         "query_dir": query_dir,
@@ -913,11 +959,438 @@ def render_search_crawl_tab():
             if logs:
                 log_box.code(logs[-12000:], language="text")
 
+def render_export_embed_align_tab():
+    st.header("4. Export / Embed / Align")
+
+    page_dir = st.session_state.get("search_crawl_config", {}).get(
+        "page_dir",
+        str(PROJECT_DIR / "pages"),
+    )
+
+    defaults = make_export_embed_align_defaults(page_dir)
+    previous_cfg = st.session_state.get("export_embed_align_config", {})
+
+    if previous_cfg.get("page_dir") != page_dir:
+        for k in [
+            "eea_txt_output_dir",
+            "eea_emb_base_path",
+            "eea_align_output_dir",
+        ]:
+            st.session_state.pop(k, None)
+        
+        previous_cfg = {}
+
+    cfg_prev = {
+        **defaults,
+        **previous_cfg,
+        "page_dir": page_dir,
+    }
+
+    st.subheader("Paths")
+
+    st.markdown("**Pages input directory**")
+    st.code(page_dir, language="text")
+    st.caption("Tự động lấy từ Pages output directory của Tab 3.")
+
+    col_p1, col_p2 = st.columns(2)
+
+    with col_p1:
+        txt_output_dir = st.text_input(
+            "Clean TXT output directory",
+            value=cfg_prev["txt_output_dir"],
+            key="eea_txt_output_dir",
+        )
+
+        tab1_vi_input_dir = get_tab1_vi_input_dir()
+        use_tab1_vi_input = bool(cfg_prev.get("use_tab1_vi_input", True))
+
+        if use_tab1_vi_input:
+            vi_input_dir = tab1_vi_input_dir
+
+            st.text_input(
+                "Vietnamese source TXT directory",
+                value=vi_input_dir,
+                disabled=True,
+                help="Đang sync từ Tab 1. Tắt checkbox bên trên để sửa thủ công.",
+            )
+
+        else:
+            vi_input_dir = st.text_input(
+                "Vietnamese source TXT directory",
+                value=cfg_prev.get("vi_input_dir", tab1_vi_input_dir),
+                key="eea_vi_input_dir",
+                disabled=False,
+                help="Đường dẫn source Việt dùng để generate embeddings.",
+            )
+        
+        use_tab1_vi_input = st.checkbox(
+            "Use Tab 1 Vietnamese input",
+            value=bool(cfg_prev.get("use_tab1_vi_input", True)),
+            key="eea_use_tab1_vi_input",
+            help=(
+                "ON: tự lấy input Việt từ Tab 1. "
+                "Nếu Tab 1 dùng input directory thì lấy input_dir; "
+                "nếu upload file thì lấy folder chứa file upload."
+            ),
+        )
+
+    with col_p2:
+        emb_base_path = st.text_input(
+            "Embedding base path",
+            value=cfg_prev["emb_base_path"],
+            key="eea_emb_base_path",
+        )
+
+        align_output_dir = st.text_input(
+            "Alignment output directory",
+            value=cfg_prev["align_output_dir"],
+            key="eea_align_output_dir",
+        )
+
+    st.subheader("Shared split config")
+
+    col_s1, col_s2, col_s3 = st.columns(3)
+
+    with col_s1:
+        split_mode = st.selectbox(
+            "Split mode",
+            ["sentence", "chunk"],
+            index=0 if cfg_prev.get("split_mode", "sentence") == "sentence" else 1,
+            key="eea_split_mode",
+        )
+
+    if split_mode == "sentence":
+        with col_s2:
+            num_of_sent = st.number_input(
+                "Num of sent",
+                min_value=1,
+                max_value=20,
+                value=int(cfg_prev.get("num_of_sent", 1)),
+                step=1,
+                key="eea_num_of_sent",
+            )
+
+        with col_s3:
+            overlap_sent = st.number_input(
+                "Overlap sent",
+                min_value=0,
+                max_value=20,
+                value=int(cfg_prev.get("overlap_sent", 0)),
+                step=1,
+                key="eea_overlap_sent",
+            )
+
+        chunk_size = int(cfg_prev.get("chunk_size", 100))
+        overlap_rate = float(cfg_prev.get("overlap_rate", 0.5))
+    else:
+        with col_s2:
+            chunk_size = st.number_input(
+                "Chunk size",
+                min_value=10,
+                max_value=2000,
+                value=int(cfg_prev.get("chunk_size", 100)),
+                step=10,
+                key="eea_chunk_size",
+            )
+
+        with col_s3:
+            overlap_rate = st.number_input(
+                "Overlap rate",
+                min_value=0.0,
+                max_value=0.95,
+                value=float(cfg_prev.get("overlap_rate", 0.5)),
+                step=0.05,
+                key="eea_overlap_rate",
+            )
+
+        num_of_sent = int(cfg_prev.get("num_of_sent", 1))
+        overlap_sent = int(cfg_prev.get("overlap_sent", 0))
+
+    st.subheader("Embedding config")
+
+    col_e1, col_e2 = st.columns(2)
+
+    with col_e1:
+        embedding_model_name = st.text_input(
+            "Embedding model",
+            value=cfg_prev.get(
+                "embedding_model_name",
+                "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+            ),
+            key="eea_embedding_model_name",
+        )
+
+        process_mode = st.selectbox(
+            "Process mode",
+            ["per_batch", "per_doc"],
+            index=0 if cfg_prev.get("process_mode", "per_batch") == "per_batch" else 1,
+            key="eea_process_mode",
+        )
+
+    with col_e2:
+        batch_size = st.number_input(
+            "Batch size",
+            min_value=1,
+            max_value=1024,
+            value=int(cfg_prev.get("batch_size", 128)),
+            step=16,
+            key="eea_batch_size",
+        )
+
+        encode_group_size = st.number_input(
+            "Encode group size",
+            min_value=1,
+            max_value=100000,
+            value=int(cfg_prev.get("encode_group_size", 2048)),
+            step=512,
+            key="eea_encode_group_size",
+        )
+
+    normalize_embeddings = st.checkbox(
+        "Normalize embeddings",
+        value=bool(cfg_prev.get("normalize_embeddings", True)),
+        key="eea_normalize_embeddings",
+    )
+
+    st.subheader("Aligner config")
+
+    col_a1, col_a2, col_a3 = st.columns(3)
+
+    with col_a1:
+        align_mode = st.selectbox(
+            "Align mode",
+            ["m-m", "1-1"],
+            index=0 if cfg_prev.get("align_mode", "m-m") == "m-m" else 1,
+            key="eea_align_mode",
+        )
+
+        top_k_docs = st.number_input(
+            "Top K docs",
+            min_value=1,
+            max_value=100,
+            value=int(cfg_prev.get("top_k_docs", 10)),
+            step=1,
+            key="eea_top_k_docs",
+        )
+
+    with col_a2:
+        top_k_chunks = st.number_input(
+            "Top K chunks",
+            min_value=1,
+            max_value=100,
+            value=int(cfg_prev.get("top_k_chunks", 5)),
+            step=1,
+            key="eea_top_k_chunks",
+        )
+
+        bimax_trim_ratio = st.number_input(
+            "Bimax trim ratio",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(cfg_prev.get("bimax_trim_ratio", 0.7)),
+            step=0.05,
+            key="eea_bimax_trim_ratio",
+        )
+
+    with col_a3:
+        edge_threshold = st.number_input(
+            "Edge threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(cfg_prev.get("edge_threshold", 0.08)),
+            step=0.01,
+            key="eea_edge_threshold",
+        )
+
+    with st.expander("Advanced aligner config", expanded=False):
+        col_adv1, col_adv2 = st.columns(2)
+
+        with col_adv1:
+            csls_k = st.number_input(
+                "CSLS K",
+                min_value=1,
+                max_value=100,
+                value=int(cfg_prev.get("csls_k", 10)),
+                step=1,
+                key="eea_csls_k",
+            )
+
+        with col_adv2:
+            csls_top_k_out = st.number_input(
+                "CSLS top K out",
+                min_value=1,
+                max_value=100,
+                value=int(cfg_prev.get("csls_top_k_out", 10)),
+                step=1,
+                key="eea_csls_top_k_out",
+            )
+
+    cfg = {
+        "page_dir": page_dir,
+        "txt_output_dir": txt_output_dir,
+        "use_tab1_vi_input": use_tab1_vi_input,
+        "vi_input_dir": vi_input_dir,
+        "emb_base_path": emb_base_path,
+        "align_output_dir": align_output_dir,
+
+        "embedding_model_name": embedding_model_name,
+        "process_mode": process_mode,
+        "batch_size": int(batch_size),
+        "encode_group_size": int(encode_group_size),
+        "normalize_embeddings": bool(normalize_embeddings),
+
+        "split_mode": split_mode,
+        "num_of_sent": int(num_of_sent),
+        "overlap_sent": int(overlap_sent),
+        "max_sent_len": int(cfg_prev.get("max_sent_len", 10000)),
+        "chunk_size": int(chunk_size),
+        "overlap_rate": float(overlap_rate),
+        "max_tokens": cfg_prev.get("max_tokens", None),
+
+        "align_mode": align_mode,
+        "top_k_chunks": int(top_k_chunks),
+        "top_k_docs": int(top_k_docs),
+        "bimax_trim_ratio": float(bimax_trim_ratio),
+        "csls_k": int(csls_k),
+        "csls_top_k_out": int(csls_top_k_out),
+        "edge_threshold": float(edge_threshold),
+
+        "verbose": st.session_state.get("global_verbose", True),
+    }
+
+    st.session_state["export_embed_align_config"] = cfg
+
+    export_cmd = build_export_clean_txt_command(cfg)
+    embed_vi_cmd = build_generate_embeddings_command(
+        cfg,
+        lang="vi",
+        input_dir=vi_input_dir,
+    )
+    embed_zh_cmd = build_generate_embeddings_command(
+        cfg,
+        lang="zh",
+        input_dir=txt_output_dir,
+    )
+    align_cmd = build_aligner_command(cfg)
+
+    st.session_state["export_cmd"] = export_cmd
+    st.session_state["embed_vi_cmd"] = embed_vi_cmd
+    st.session_state["embed_zh_cmd"] = embed_zh_cmd
+    st.session_state["align_cmd"] = align_cmd
+
+    st.divider()
+
+    st.subheader("Command preview")
+
+    st.markdown("**Export clean TXT**")
+    st.code(shell_command(export_cmd), language="bash")
+
+    st.markdown("**Generate VI embeddings**")
+    st.code(shell_command(embed_vi_cmd), language="bash")
+
+    st.markdown("**Generate ZH embeddings**")
+    st.code(shell_command(embed_zh_cmd), language="bash")
+
+    st.markdown("**Aligner**")
+    st.code(shell_command(align_cmd), language="bash")
+
+    col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+
+    with col_b1:
+        run_export_btn = st.button("Run Export", use_container_width=True, key="eea_run_export")
+
+    with col_b2:
+        run_embed_btn = st.button("Run Embeddings", use_container_width=True, key="eea_run_embeddings")
+
+    with col_b3:
+        run_align_btn = st.button("Run Aligner", use_container_width=True, key="eea_run_aligner")
+
+    with col_b4:
+        run_all_btn = st.button("Run All", type="primary", use_container_width=True, key="eea_run_all")
+
+    def run_cmd_with_log(cmd: list[str], title: str, log_box, logs: str) -> str:
+        logs += f"\nStarting {title}...\n"
+        log_box.code(logs[-12000:], language="text")
+
+        for line in run_command_stream(cmd, cwd=PROJECT_DIR):
+            logs += line
+            log_box.code(logs[-12000:], language="text")
+
+        logs += f"\n{title} finished.\n"
+        log_box.code(logs[-12000:], language="text")
+        return logs
+
+    if run_export_btn or run_embed_btn or run_align_btn or run_all_btn:
+        log_box = st.empty()
+        logs = ""
+
+        try:
+            if run_export_btn or run_all_btn:
+                page_files = collect_json_files(page_dir, recursive=True)
+                if not page_files:
+                    st.error("No page JSON found. Run Tab 3 crawl first.")
+                    st.stop()
+
+                Path(txt_output_dir).mkdir(parents=True, exist_ok=True)
+                logs = run_cmd_with_log(export_cmd, "export_clean_txt", log_box, logs)
+
+            if run_embed_btn or run_all_btn:
+                if not Path(vi_input_dir).exists():
+                    st.error(f"Vietnamese source dir not found: {vi_input_dir}")
+                    st.stop()
+
+                if not Path(txt_output_dir).exists():
+                    st.error(f"ZH clean TXT dir not found: {txt_output_dir}")
+                    st.stop()
+
+                Path(emb_base_path).mkdir(parents=True, exist_ok=True)
+                logs = run_cmd_with_log(embed_vi_cmd, "generate VI embeddings", log_box, logs)
+                logs = run_cmd_with_log(embed_zh_cmd, "generate ZH embeddings", log_box, logs)
+
+            if run_align_btn or run_all_btn:
+                if not Path(emb_base_path).exists():
+                    st.error(f"Embedding base path not found: {emb_base_path}")
+                    st.stop()
+
+                Path(align_output_dir).mkdir(parents=True, exist_ok=True)
+                logs = run_cmd_with_log(align_cmd, "aligner", log_box, logs)
+
+                result_dir = make_alignment_result_package(
+                    align_output_dir=align_output_dir,
+                    vi_input_dir=vi_input_dir,
+                    txt_output_dir=txt_output_dir,
+                )
+
+                st.success(f"Alignment result package created: {result_dir}")
+
+                result_files = sorted([p for p in result_dir.rglob("*") if p.is_file()])
+                if result_files:
+                    st.subheader("Alignment result package files")
+                    render_file_table(result_files)
+
+                zip_path = make_zip_from_dir(result_dir)
+
+                with zip_path.open("rb") as f:
+                    st.download_button(
+                        "Download result ZIP",
+                        data=f,
+                        file_name=zip_path.name,
+                        mime="application/zip",
+                        key="eea_download_result_zip",
+                    )
+
+            st.success("Done.")
+
+        except Exception as e:
+            st.error(str(e))
+            if logs:
+                log_box.code(logs[-12000:], language="text")
+
 def main():
     init_state()
 
     st.title("Quốc ngữ → Hán Pipeline UI")
-    st.caption("v2 — Keyword Extraction → Build Queries → Search / Crawl")
+    st.caption("v3 — Keyword Extraction → Build Queries → Search / Crawl → Emb / Align")
 
     st.sidebar.header("Global settings")
 
@@ -929,10 +1402,11 @@ def main():
 
     st.sidebar.caption(f"Project dir: `{PROJECT_DIR}`")
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "1. Keyword Extraction",
         "2. Build Queries",
         "3. Search / Crawl",
+        "4. Export / Embed / Align",
     ])
 
     with tab1:
@@ -943,6 +1417,9 @@ def main():
 
     with tab3:
         render_search_crawl_tab()
+
+    with tab4:
+        render_export_embed_align_tab()
 
 
 if __name__ == "__main__":

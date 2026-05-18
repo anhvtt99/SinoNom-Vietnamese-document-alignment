@@ -1,7 +1,11 @@
 import shlex
 import subprocess
+import shutil
+import unicodedata
+import shutil
 from pathlib import Path
 
+import pandas as pd
 
 INPUT_DIR_MODE = "Use input directory"
 UPLOAD_FILE_MODE = "Upload one .txt file"
@@ -172,3 +176,200 @@ def build_crawl_command(cfg: dict) -> list[str]:
         cmd.append("--verbose")
 
     return cmd
+
+def build_export_clean_txt_command(cfg: dict) -> list[str]:
+    cmd = [
+        "python", "-u", "-m", "lib.web.export_clean_txt",
+        "--page_dir", cfg.get("page_dir", ""),
+        "--output_dir", cfg.get("txt_output_dir", ""),
+
+        # fixed export config
+        "--min_text_len", "500",
+        "--min_han_chars", "100",
+        "--min_han_ratio", "0.60",
+        "--dedup_scope", "global",
+        "--dedup_opencc", "s2t",
+        "--prefer_traditional",
+        "--near_dedup",
+        "--near_threshold", "0.70",
+        "--ngram_n", "3",
+    ]
+
+    if cfg.get("verbose", True):
+        cmd.append("--verbose")
+
+    return cmd
+
+
+def build_generate_embeddings_command(cfg: dict, *, lang: str, input_dir: str) -> list[str]:
+    cmd = [
+        "python", "-u", "-m", "lib.aligner.generate_embeddings",
+        "--input_dir", input_dir,
+        "--output_dir", cfg.get("emb_base_path", ""),
+        "--lang", lang,
+        "--model_name_or_path", cfg.get("embedding_model_name", ""),
+        "--split_mode", cfg.get("split_mode", "sentence"),
+        "--batch_size", str(cfg.get("batch_size", 128)),
+        "--process_mode", cfg.get("process_mode", "per_batch"),
+        "--encode_group_size", str(cfg.get("encode_group_size", 2048)),
+    ]
+
+    if cfg.get("split_mode", "sentence") == "sentence":
+        cmd.extend([
+            "--num_of_sent", str(cfg.get("num_of_sent", 1)),
+            "--overlap_sent", str(cfg.get("overlap_sent", 0)),
+            "--max_sent_len", str(cfg.get("max_sent_len", 10000)),
+        ])
+    else:
+        cmd.extend([
+            "--chunk_size", str(cfg.get("chunk_size", 100)),
+            "--overlap_rate", str(cfg.get("overlap_rate", 0.5)),
+        ])
+
+        if cfg.get("max_tokens") is not None:
+            cmd.extend(["--max_tokens", str(cfg.get("max_tokens"))])
+
+    if not cfg.get("normalize_embeddings", True):
+        cmd.append("--no_normalize")
+
+    return cmd
+
+
+def build_aligner_command(cfg: dict) -> list[str]:
+    cmd = [
+        "python", "-u", "-m", "lib.aligner.aligner",
+        "--emb_base_path", cfg.get("emb_base_path", ""),
+        "--src_lang", "vi",
+        "--tar_lang", "zh",
+        "--align_mode", cfg.get("align_mode", "m-m"),
+
+        # shared split config
+        "--split_mode", cfg.get("split_mode", "sentence"),
+        "--num_of_sent", str(cfg.get("num_of_sent", 1)),
+        "--overlap_sent", str(cfg.get("overlap_sent", 0)),
+        "--chunk_size", str(cfg.get("chunk_size", 100)),
+        "--overlap_rate", str(cfg.get("overlap_rate", 0.5)),
+
+        # aligner params
+        "--top_k_chunks", str(cfg.get("top_k_chunks", 5)),
+        "--top_k_docs", str(cfg.get("top_k_docs", 10)),
+        "--bimax_trim_ratio", str(cfg.get("bimax_trim_ratio", 0.7)),
+        "--csls_k", str(cfg.get("csls_k", 10)),
+        "--csls_top_k_out", str(cfg.get("csls_top_k_out", 10)),
+        "--edge_threshold", str(cfg.get("edge_threshold", 0.08)),
+        "--save_results",
+        "--output_path", cfg.get("align_output_dir", ""),
+    ]
+
+    return cmd
+
+
+def norm_key(x: str) -> str:
+    x = str(x or "").strip()
+    x = unicodedata.normalize("NFC", x)
+    return x
+
+
+def key_variants(x: str) -> set[str]:
+    x = str(x or "").strip()
+
+    variants = set()
+
+    for form in ["NFC", "NFD", "NFKC", "NFKD"]:
+        y = unicodedata.normalize(form, x)
+        p = Path(y)
+
+        variants.add(y)
+        variants.add(p.name)
+        variants.add(p.stem)
+
+    return {v for v in variants if v}
+
+
+def build_file_map(input_dir: str) -> dict[str, Path]:
+    root = Path(input_dir)
+    out = {}
+
+    if not root.exists():
+        return out
+
+    for p in root.rglob("*.txt"):
+        for k in key_variants(p.name):
+            out[k] = p
+        for k in key_variants(p.stem):
+            out[k] = p
+
+    return out
+
+
+def copy_matched_files(input_dir: str, names: set[str], out_dir: Path) -> int:
+    file_map = build_file_map(input_dir)
+    copied = 0
+    seen = set()
+
+    for name in names:
+        matched = None
+
+        for k in key_variants(name):
+            if k in file_map:
+                matched = file_map[k]
+                break
+
+        if matched and matched.exists() and matched not in seen:
+            shutil.copy2(matched, out_dir / matched.name)
+            seen.add(matched)
+            copied += 1
+
+    return copied
+
+def make_alignment_result_package(
+    *,
+    align_output_dir: str,
+    vi_input_dir: str,
+    txt_output_dir: str,
+    result_dir_name: str = "result",
+) -> Path:
+    align_output = Path(align_output_dir)
+
+    tsv_files = sorted(
+        align_output.glob("*.tsv"),
+        key=lambda p: p.stat().st_mtime,
+    )
+
+    if not tsv_files:
+        raise FileNotFoundError(f"No alignment TSV found in: {align_output}")
+
+    latest_tsv = tsv_files[-1]
+
+    result_dir = align_output / result_dir_name
+    src_dir = result_dir / "src"
+    tar_dir = result_dir / "tar"
+
+    src_dir.mkdir(parents=True, exist_ok=True)
+    tar_dir.mkdir(parents=True, exist_ok=True)
+
+    result_tsv = result_dir / "aligner_result.tsv"
+    shutil.copy2(latest_tsv, result_tsv)
+
+    df = pd.read_csv(latest_tsv, sep="\t")
+
+    src_names = set(str(x) for x in df["src_idx"].dropna().tolist())
+    tar_names = set(str(x) for x in df["tar_idx"].dropna().tolist())
+
+
+    n_src = copy_matched_files(vi_input_dir, src_names, src_dir)
+    n_tar = copy_matched_files(txt_output_dir, tar_names, tar_dir)
+
+    return result_dir
+
+def make_zip_from_dir(src_dir: str | Path) -> Path:
+    src_dir = Path(src_dir)
+
+    zip_path = shutil.make_archive(
+        base_name=str(src_dir),
+        format="zip",
+        root_dir=str(src_dir.parent),
+        base_dir=src_dir.name,
+    )
+
+    return Path(zip_path)
