@@ -30,7 +30,7 @@ st.set_page_config(
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR
-
+INTERMEDIATE_DIR = PROJECT_DIR / "intermediate_result"
 
 def make_keyword_defaults(project_dir: Path) -> dict:
     return {
@@ -38,7 +38,7 @@ def make_keyword_defaults(project_dir: Path) -> dict:
         "uploaded_input_path": "",
         "input_dir": str(project_dir / "data/In/Txt_Viet/Viet_chapters"),
         "upload_dir": str(project_dir / "ui_uploads"),
-        "output_dir": str(project_dir / "keyword"),
+        "output_dir": str(INTERMEDIATE_DIR / "keyword"),
         "ner_model_name": "NlpHUST/ner-vietnamese-electra-base",
         "sbert_model_name": "bkai-foundation-models/vietnamese-bi-encoder",
         "stopwords_path": str(project_dir / "lib/resources/stopwords_vi.txt"),
@@ -147,6 +147,240 @@ def get_tab1_vi_input_dir() -> str:
         str(PROJECT_DIR / "data/In/Txt_Viet/Viet_chapters"),
     )
 
+def build_global_pipeline_configs() -> dict:
+    """
+    Global run lấy setting hiện tại từ các tab.
+    Vì keyword output mặc định đã là ./intermediate_result/keyword,
+    các output sau sẽ tự đi theo parent ./intermediate_result.
+    """
+    verbose = st.session_state.get("global_verbose", True)
+
+    # Tab 1
+    kw_cfg = {
+        **st.session_state.get("kw_config", make_keyword_defaults(PROJECT_DIR)),
+        "verbose": verbose,
+    }
+
+    # Tab 2, sync input với output của Tab 1
+    query_cfg_prev = st.session_state.get(
+        "query_config",
+        make_query_defaults(kw_cfg["output_dir"]),
+    )
+    query_cfg = {
+        **query_cfg_prev,
+        "keyword_input_dir": kw_cfg["output_dir"],
+        "verbose": verbose,
+    }
+
+    # Tab 3, sync input với output của Tab 2
+    search_cfg_prev = st.session_state.get(
+        "search_crawl_config",
+        make_search_crawl_defaults(query_cfg["query_output_dir"]),
+    )
+    search_crawl_cfg = {
+        **search_cfg_prev,
+        "query_dir": query_cfg["query_output_dir"],
+        "verbose": verbose,
+    }
+
+    # Tab 4, sync input với output của Tab 3
+    eea_cfg_prev = st.session_state.get(
+        "export_embed_align_config",
+        make_export_embed_align_defaults(search_crawl_cfg["page_dir"]),
+    )
+
+    if eea_cfg_prev.get("use_tab1_vi_input", True):
+        vi_input_dir = get_tab1_vi_input_dir()
+    else:
+        vi_input_dir = eea_cfg_prev.get("vi_input_dir", get_tab1_vi_input_dir())
+
+    export_embed_align_cfg = {
+        **eea_cfg_prev,
+        "page_dir": search_crawl_cfg["page_dir"],
+        "vi_input_dir": vi_input_dir,
+        "verbose": verbose,
+    }
+
+    return {
+        "kw": kw_cfg,
+        "query": query_cfg,
+        "search_crawl": search_crawl_cfg,
+        "export_embed_align": export_embed_align_cfg,
+    }
+
+def render_global_run_all():
+    st.sidebar.divider()
+    st.sidebar.subheader("Global pipeline")
+
+    st.sidebar.caption(
+        "Load all config from tabs. "
+    )
+
+    run_global_btn = st.sidebar.button(
+        "Run ALL pipeline",
+        type="primary",
+        use_container_width=True,
+        key="global_run_all_pipeline",
+    )
+
+    if not run_global_btn:
+        return
+
+    cfgs = build_global_pipeline_configs()
+
+    kw_cfg = cfgs["kw"]
+    query_cfg = cfgs["query"]
+    search_crawl_cfg = cfgs["search_crawl"]
+    eea_cfg = cfgs["export_embed_align"]
+
+    keyword_cmd = build_keyword_command(kw_cfg)
+    query_cmd = build_query_command(query_cfg)
+    search_cmd = build_search_command(search_crawl_cfg)
+    crawl_cmd = build_crawl_command(search_crawl_cfg)
+    export_cmd = build_export_clean_txt_command(eea_cfg)
+
+    embed_vi_cmd = build_generate_embeddings_command(
+        eea_cfg,
+        lang="vi",
+        input_dir=eea_cfg["vi_input_dir"],
+    )
+
+    embed_zh_cmd = build_generate_embeddings_command(
+        eea_cfg,
+        lang="zh",
+        input_dir=eea_cfg["txt_output_dir"],
+    )
+
+    align_cmd = build_aligner_command(eea_cfg)
+
+    st.subheader("Global Run All")
+    st.info(f"Intermediate dir: {INTERMEDIATE_DIR}")
+
+    with st.expander("Global command preview", expanded=False):
+        st.markdown("**1. Keyword extraction**")
+        st.code(shell_command(keyword_cmd), language="bash")
+
+        st.markdown("**2. Build query**")
+        st.code(shell_command(query_cmd), language="bash")
+
+        st.markdown("**3. Search URLs**")
+        st.code(shell_command(search_cmd), language="bash")
+
+        st.markdown("**4. Fetch pages**")
+        st.code(shell_command(crawl_cmd), language="bash")
+
+        st.markdown("**5. Export clean TXT**")
+        st.code(shell_command(export_cmd), language="bash")
+
+        st.markdown("**6. Generate VI embeddings**")
+        st.code(shell_command(embed_vi_cmd), language="bash")
+
+        st.markdown("**7. Generate ZH embeddings**")
+        st.code(shell_command(embed_zh_cmd), language="bash")
+
+        st.markdown("**8. Aligner**")
+        st.code(shell_command(align_cmd), language="bash")
+
+    log_box = st.empty()
+    logs = ""
+
+    def run_step(title: str, cmd: list[str]) -> None:
+        nonlocal logs
+
+        logs += f"\n{'=' * 80}\n"
+        logs += f"Starting {title}...\n"
+        logs += f"{'=' * 80}\n"
+        log_box.code(logs[-20000:], language="text")
+
+        for line in run_command_stream(cmd, cwd=PROJECT_DIR):
+            logs += line
+            log_box.code(logs[-20000:], language="text")
+
+        logs += f"\n{title} finished.\n"
+        log_box.code(logs[-20000:], language="text")
+
+    try:
+        if kw_cfg.get("input_mode") == UPLOAD_FILE_MODE and not kw_cfg.get("uploaded_input_path"):
+            st.error("Tab 1 đang ở upload mode nhưng chưa có uploaded .txt file.")
+            st.stop()
+
+        if kw_cfg.get("input_mode") == INPUT_DIR_MODE and not Path(kw_cfg["input_dir"]).exists():
+            st.error(f"Input directory not found: {kw_cfg['input_dir']}")
+            st.stop()
+
+        if not Path(eea_cfg["vi_input_dir"]).exists():
+            st.error(f"Vietnamese source dir not found: {eea_cfg['vi_input_dir']}")
+            st.stop()
+
+        # Tạo các output dirs cần thiết
+        for d in [
+            kw_cfg["output_dir"],
+            query_cfg["query_output_dir"],
+            query_cfg["translation_cache_dir"],
+            search_crawl_cfg["url_dir"],
+            search_crawl_cfg["page_dir"],
+            eea_cfg["txt_output_dir"],
+            eea_cfg["emb_base_path"],
+            eea_cfg["align_output_dir"],
+        ]:
+            Path(d).mkdir(parents=True, exist_ok=True)
+
+        run_step("Keyword extraction", keyword_cmd)
+        run_step("Build query", query_cmd)
+        run_step("Search URLs", search_cmd)
+        run_step("Fetch pages", crawl_cmd)
+        run_step("Export clean TXT", export_cmd)
+        run_step("Generate VI embeddings", embed_vi_cmd)
+        run_step("Generate ZH embeddings", embed_zh_cmd)
+        run_step("Aligner", align_cmd)
+
+        result_dir = make_alignment_result_package(
+            align_output_dir=eea_cfg["align_output_dir"],
+            vi_input_dir=eea_cfg["vi_input_dir"],
+            txt_output_dir=eea_cfg["txt_output_dir"],
+        )
+
+        result_zip = make_zip_from_dir(result_dir)
+        intermediate_zip = make_zip_from_dir(INTERMEDIATE_DIR)
+
+        st.success("Global pipeline finished.")
+
+        st.subheader("Downloads")
+
+        col_d1, col_d2 = st.columns(2)
+
+        with col_d1:
+            with result_zip.open("rb") as f:
+                st.download_button(
+                    "Download result.zip",
+                    data=f,
+                    file_name="result.zip",
+                    mime="application/zip",
+                    key="global_download_result_zip",
+                    use_container_width=True,
+                )
+
+        with col_d2:
+            with intermediate_zip.open("rb") as f:
+                st.download_button(
+                    "Download intermediate_result.zip",
+                    data=f,
+                    file_name="intermediate_result.zip",
+                    mime="application/zip",
+                    key="global_download_intermediate_zip",
+                    use_container_width=True,
+                )
+
+        result_files = sorted([p for p in result_dir.rglob("*") if p.is_file()])
+        if result_files:
+            st.subheader("Final result package")
+            render_file_table(result_files)
+
+    except Exception as e:
+        st.error(str(e))
+        if logs:
+            log_box.code(logs[-20000:], language="text")
+
 def init_state():
     if "kw_config" not in st.session_state:
         st.session_state["kw_config"] = make_keyword_defaults(PROJECT_DIR)
@@ -164,14 +398,13 @@ def init_state():
     if "export_embed_align_config" not in st.session_state:
         page_dir = st.session_state.get("search_crawl_config", {}).get(
             "page_dir",
-            str(PROJECT_DIR / "pages"),
+            str(INTERMEDIATE_DIR / "pages"),
         )
         st.session_state["export_embed_align_config"] = make_export_embed_align_defaults(page_dir)
     
     st.session_state.setdefault("export_cmd", [])
     st.session_state.setdefault("embed_vi_cmd", [])
     st.session_state.setdefault("embed_zh_cmd", [])
-    st.session_state.setdefault("align_cmd", [])
     st.session_state.setdefault("align_cmd", [])
     st.session_state.setdefault("input_files", [])
     st.session_state.setdefault("keyword_cmd", [])
@@ -666,7 +899,7 @@ def render_search_crawl_tab():
 
     query_dir = st.session_state.get("query_config", {}).get(
         "query_output_dir",
-        str(PROJECT_DIR / "queries"),
+        str(INTERMEDIATE_DIR / "queries"),
     )
 
     search_defaults = make_search_crawl_defaults(query_dir)
@@ -964,7 +1197,7 @@ def render_export_embed_align_tab():
 
     page_dir = st.session_state.get("search_crawl_config", {}).get(
         "page_dir",
-        str(PROJECT_DIR / "pages"),
+        str(INTERMEDIATE_DIR / "pages"),
     )
 
     defaults = make_export_embed_align_defaults(page_dir)
@@ -1402,6 +1635,7 @@ def main():
 
     st.sidebar.caption(f"Project dir: `{PROJECT_DIR}`")
 
+    render_global_run_all()
     tab1, tab2, tab3, tab4 = st.tabs([
         "1. Keyword Extraction",
         "2. Build Queries",
