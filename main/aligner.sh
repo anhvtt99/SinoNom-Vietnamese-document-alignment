@@ -29,7 +29,7 @@ echo "STARTING DOCUMENT ALIGNMENT PIPELINE"
 echo "Config: $SPLIT_MODE (n=$NUM_SENT)"
 echo "Threshold=$THRESHOLD"
 echo "====================================================="
-python ../lib/aligner.py \
+python ../lib/aligner/aligner.py \
     --emb_base_path "$EMB_BASE_PATH" \
     --src_lang "$SRC_LANG" \
     --tar_lang "$TAR_LANG" \

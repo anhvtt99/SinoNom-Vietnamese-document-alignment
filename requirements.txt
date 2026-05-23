@@ -6,3 +6,14 @@ numpy
 torch
 seaborn
 matplotlib
+langchain_text_splitters
+google-generativeai
+python-dotenv
+aiohttp
+trafilatura
+beautifulsoup4
+lxml
+pymupdf
+opencc-python-reimplemented
+py_vncorenlp
+streamlit

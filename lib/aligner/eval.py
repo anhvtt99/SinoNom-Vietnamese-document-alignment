@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from utils import AlignerIO
+from lib.utils import AlignerIO
 
 # -----------------------
 # Metric
@@ -149,7 +149,7 @@ def eval(
 # Venn Diagram
 def plot_alignment_venn(metrics: Dict[str, float], figsize: Tuple[int, int] = (8, 6), save_path=None):
     """
-    Plot Venn diagram to visualize the connection between Ground Truth và Prediction.
+    Plot Venn diagram to visualize the connection between Ground Truth and Prediction.
     """
     try:
         from matplotlib_venn import venn2

@@ -1,5 +1,6 @@
 import os
-from typing import Union, Iterable, List, Dict, Any
+import random
+from typing import Union, Tuple, List, Dict, Any
 from pathlib import Path
 import json
 
@@ -94,7 +95,7 @@ class AlignerIO:
             if emb_file_path.exists():
                 results[idx] = np.load(emb_file_path).astype('float32')
             else:
-                print(f"Warning: File {emb_file_path} không tồn tại.")
+                print(f"Warning: File {emb_file_path} not found.")
         
         return results
 
@@ -133,3 +134,41 @@ def get_torch_device(prefer_cuda: bool = True) -> torch.device:
 def get_filename_only(path_str: str) -> str:
     """Returns 'document.txt' from '/path/to/data/document.txt'"""
     return os.path.basename(path_str)
+
+# -----------------------
+# Helpers: function for normalization vietnamese word
+# -----------------------
+def normalize_vietnamese_phrase(text: str) -> str:
+    """
+    Normalize keyword text for stable comparison.
+    Notes:
+        - lowercased
+        - underscores converted to spaces
+        - repeated spaces collapsed
+    """
+    text = text.lower().replace("_", " ")
+    return " ".join(text.split())
+
+# -----------------------
+# Helpers: sleep timing
+# -----------------------
+def random_sleep_seconds(seconds_range: Tuple[float, float]) -> float:
+    """
+    Return a random number of seconds from a (min, max) range.
+
+    Examples:
+        random_sleep_seconds((0.5, 1.0)) -> 0.73
+        random_sleep_seconds((0.0, 0.0)) -> 0.0
+    """
+    lo, hi = seconds_range
+
+    lo = max(0.0, float(lo))
+    hi = max(0.0, float(hi))
+
+    if hi <= 0:
+        return 0.0
+
+    if hi < lo:
+        lo, hi = hi, lo
+
+    return random.uniform(lo, hi)
