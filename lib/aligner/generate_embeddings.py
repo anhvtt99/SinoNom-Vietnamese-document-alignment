@@ -576,5 +576,72 @@ def main():
             max_tokens=args.max_tokens,
         )
 
+def run_embedding_generation(
+    model: "SentenceTransformer",
+    input_dir: str,
+    output_dir: str,
+    lang: str,
+    split_mode: str = "sentence",
+    batch_size: int = 128,
+    normalize_embeddings: bool = True,
+    process_mode: str = "per_batch",
+    encode_group_size: int = 2048,
+    num_of_sent: int = 1,
+    overlap_sent: int = 0,
+    max_sent_len: int = 10000,
+    chunk_size: int = 100,
+    overlap_rate: float = 0.5,
+    max_tokens=None,
+    file_ext: str = ".txt",
+) -> None:
+    """
+    In-process entry point — model passed in pre-loaded.
+    Same logic as main() without the model-loading block.
+    Designed to be called from Streamlit using @st.cache_resource models.
+    """
+    input_path = Path(input_dir)
+    docs = sorted(list(input_path.glob(f"*{file_ext}")))
+
+    if not docs:
+        print(f"Warning: No {file_ext} files found in {input_dir}")
+        return
+
+    process_fn = _process_per_batch if process_mode == "per_batch" else _process_per_doc
+
+    if process_mode == "per_batch":
+        process_fn(
+            docs=docs,
+            embeddings_output=output_dir,
+            lang=lang,
+            model=model,
+            normalize_embeddings=normalize_embeddings,
+            split_mode=split_mode,
+            batch_size=batch_size,
+            encode_group_size=encode_group_size,
+            num_of_sent=num_of_sent,
+            overlap_sent=overlap_sent,
+            max_sent_len=max_sent_len,
+            chunk_size=chunk_size,
+            overlap_rate=overlap_rate,
+            max_tokens=max_tokens,
+        )
+    else:
+        process_fn(
+            docs=docs,
+            embeddings_output=output_dir,
+            lang=lang,
+            model=model,
+            normalize_embeddings=normalize_embeddings,
+            split_mode=split_mode,
+            batch_size=batch_size,
+            num_of_sent=num_of_sent,
+            overlap_sent=overlap_sent,
+            max_sent_len=max_sent_len,
+            chunk_size=chunk_size,
+            overlap_rate=overlap_rate,
+            max_tokens=max_tokens,
+        )
+
+
 if __name__ == "__main__":
     main()

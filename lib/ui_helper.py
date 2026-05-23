@@ -164,14 +164,21 @@ def build_crawl_command(cfg: dict) -> list[str]:
         "--url_dir", cfg.get("url_dir", ""),
         "--output_dir", cfg.get("page_dir", ""),
         "--sleep_range",
-        str(cfg.get("sleep_min", 3.0)),
-        str(cfg.get("sleep_max", 6.0)),
+        str(cfg.get("sleep_min", 1.0)),
+        str(cfg.get("sleep_max", 2.0)),
         "--timeout", str(cfg.get("timeout", 20)),
         "--min_text_len", str(cfg.get("min_text_len", 200)),
+        "--max_concurrent", str(cfg.get("max_concurrent", 5)),
+        "--max_doc_concurrent", str(cfg.get("max_doc_concurrent", 3)),
+        "--max_retries", str(cfg.get("max_retries", 3)),
+        "--retry_backoff", str(cfg.get("retry_backoff", 2.0)),
     ]
 
     if cfg.get("collect_assets", True):
         cmd.append("--collect_assets")
+
+    if cfg.get("force", False):
+        cmd.append("--force")
 
     if cfg.get("verbose", True):
         cmd.append("--verbose")

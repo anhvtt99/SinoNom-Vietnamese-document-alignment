@@ -1,3 +1,6 @@
+import contextlib
+import io
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -20,6 +23,65 @@ from lib.ui_helper import (
     run_command_stream,
     shell_command,
 )
+
+
+# =============================================================================
+# Cached model loaders — loaded once per Streamlit session, not per run.
+# @st.cache_resource persists across button clicks and page reruns.
+# =============================================================================
+
+@st.cache_resource
+def _load_keyword_models(ner_model_name: str, sbert_model_name: str, vncorenlp_dir: str):
+    """Load NER, SBERT, and VnCoreNLP once and keep them warm."""
+    import io as _io
+    import contextlib as _ctx
+    import py_vncorenlp
+    from transformers import pipeline as hf_pipeline
+    from sentence_transformers import SentenceTransformer
+    from lib.utils import cuda_available
+
+    vncorenlp_path = Path(vncorenlp_dir)
+    vncorenlp_path.mkdir(parents=True, exist_ok=True)
+    if not any(vncorenlp_path.iterdir()):
+        with _ctx.redirect_stdout(_io.StringIO()), _ctx.redirect_stderr(_io.StringIO()):
+            py_vncorenlp.download_model(save_dir=str(vncorenlp_path))
+
+    annotator = py_vncorenlp.VnCoreNLP(
+        annotators=["wseg", "pos"],
+        save_dir=str(vncorenlp_path),
+    )
+    ner_pipe = hf_pipeline(
+        "token-classification",
+        model=ner_model_name,
+        tokenizer=ner_model_name,
+        aggregation_strategy="simple",
+        device=0 if cuda_available() else -1,
+    )
+    sbert = SentenceTransformer(sbert_model_name)
+    return annotator, ner_pipe, sbert
+
+
+@st.cache_resource
+def _load_stopwords(stopwords_path: str) -> frozenset:
+    """Load stopwords once and cache."""
+    from lib.web.VnKeywordExtractor import normalize_vietnamese_phrase
+    path = Path(stopwords_path)
+    if not path.exists():
+        return frozenset()
+    with path.open("r", encoding="utf-8") as f:
+        return frozenset(
+            normalize_vietnamese_phrase(line.strip())
+            for line in f if line.strip()
+        )
+
+
+@st.cache_resource
+def _load_embedding_model(model_name: str):
+    """Load SentenceTransformer once and keep it warm."""
+    from sentence_transformers import SentenceTransformer
+    from lib.utils import cuda_available
+    device = "cuda" if cuda_available() else "cpu"
+    return SentenceTransformer(model_name, device=device)
 
 
 st.set_page_config(
@@ -82,8 +144,8 @@ def make_search_crawl_defaults(query_output_dir: str) -> dict:
         "include_omitted": True,
         "early_stop_url_count": 3,
 
-        "sleep_min": 3.0,
-        "sleep_max": 6.0,
+        "sleep_min": 1.0,
+        "sleep_max": 2.0,
         "timeout": 20,
         "min_text_len": 200,
         "collect_assets": True,
@@ -269,6 +331,38 @@ def render_global_downloads():
                 st.subheader("Final result package")
                 render_file_table(result_files)
 
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s:02d}s"
+
+
+def _render_timing_table(placeholder, timings: list) -> None:
+    """Render timing table into a st.empty() placeholder."""
+    if not timings:
+        return
+    rows = []
+    for t in timings:
+        rows.append({
+            "Step": t["step"],
+            "Docs": str(t["n_docs"]) if t.get("n_docs") else "—",
+            "Duration": _format_duration(t["duration_s"]),
+            "Status": t["status"],
+            "duration_s": t["duration_s"],
+        })
+    total_s = sum(t["duration_s"] for t in timings)
+    rows.append({
+        "Step": "TOTAL",
+        "Docs": "",
+        "Duration": _format_duration(total_s),
+        "Status": "",
+        "duration_s": total_s,
+    })
+    df = pd.DataFrame(rows).drop(columns=["duration_s"])
+    placeholder.table(df)
+
+
 def render_global_run_all():
     st.header("0. Global Run All")
     st.caption("Load all config from tabs and run the full pipeline.")
@@ -340,27 +434,86 @@ def render_global_run_all():
         st.markdown("**8. Aligner**")
         st.code(shell_command(align_cmd), language="bash")
 
+    _tcol1, _tcol2, _tcol3 = st.columns([4, 1, 1])
+    with _tcol1:
+        st.subheader("Step Timings")
+    with _tcol2:
+        if st.button("Clear timings", key="clear_timings"):
+            st.session_state["pipeline_timings"] = []
+    with _tcol3:
+        if st.button("🗑️ Release GPU", key="release_gpu", help="Unload cached models and free VRAM"):
+            st.cache_resource.clear()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+            st.success("GPU models released. They will reload on next run.")
+
+    timing_box = st.empty()
+    timings: list = []
+
+    # Restore previous run's timings so they're visible immediately on rerun
+    if st.session_state.get("pipeline_timings"):
+        timings = list(st.session_state["pipeline_timings"])
+        _render_timing_table(timing_box, timings)
+
     log_box = st.empty()
     logs = ""
 
-    def run_step(title: str, cmd: list[str]) -> None:
-        nonlocal logs
+    def _record(title: str, duration_s: float, ok: bool, n_docs: int = 0) -> None:
+        timings.append({
+            "step": title,
+            "duration_s": duration_s,
+            "status": "✅" if ok else "❌",
+            "n_docs": n_docs,
+        })
+        st.session_state["pipeline_timings"] = list(timings)
+        _render_timing_table(timing_box, timings)
 
+    def run_step(title: str, cmd: list[str], n_docs: int = 0) -> None:
+        nonlocal logs
         logs += f"\n{'=' * 80}\n"
-        logs += f"Starting {title}...\n"
+        logs += f"[{title}] starting...\n"
         logs += f"{'=' * 80}\n"
         log_box.code(logs[-20000:], language="text")
-
-        for line in run_command_stream(cmd, cwd=PROJECT_DIR):
-            logs += line
+        t0 = time.perf_counter()
+        ok = False
+        try:
+            for line in run_command_stream(cmd, cwd=PROJECT_DIR):
+                logs += line
+                log_box.code(logs[-20000:], language="text")
+            ok = True
+        finally:
+            duration = time.perf_counter() - t0
+            logs += f"\n[{title}] finished in {_format_duration(duration)}.\n"
             log_box.code(logs[-20000:], language="text")
+            _record(title, duration, ok, n_docs)
 
-        logs += f"\n{title} finished.\n"
+    def run_step_inprocess(title: str, fn, *args, n_docs: int = 0, **kwargs) -> None:
+        nonlocal logs
+        logs += f"\n{'=' * 80}\n"
+        logs += f"[{title}] starting (in-process)...\n"
+        logs += f"{'=' * 80}\n"
         log_box.code(logs[-20000:], language="text")
+        t0 = time.perf_counter()
+        ok = False
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                fn(*args, **kwargs)
+            logs += buf.getvalue()
+            ok = True
+        finally:
+            duration = time.perf_counter() - t0
+            logs += f"\n[{title}] finished in {_format_duration(duration)}.\n"
+            log_box.code(logs[-20000:], language="text")
+            _record(title, duration, ok, n_docs)
 
     try:
         if kw_cfg.get("input_mode") == UPLOAD_FILE_MODE and not kw_cfg.get("uploaded_input_path"):
-            st.error("Tab 1 đang ở upload mode nhưng chưa có uploaded .txt file.")
+            st.error("Upload mode is active but no file has been uploaded yet.")
             st.stop()
 
         if kw_cfg.get("input_mode") == INPUT_DIR_MODE and not Path(kw_cfg["input_dir"]).exists():
@@ -371,7 +524,22 @@ def render_global_run_all():
             st.error(f"Vietnamese source dir not found: {eea_cfg['vi_input_dir']}")
             st.stop()
 
-        # Tạo các output dirs cần thiết
+        # --- Q2: clean stale files from upload dir before processing ---
+        if kw_cfg.get("input_mode") == UPLOAD_FILE_MODE:
+            upload_dir = Path(kw_cfg.get("upload_dir", ""))
+            current_file = kw_cfg.get("uploaded_input_path", "")
+            if upload_dir.exists():
+                stale = [
+                    f for f in upload_dir.glob("*.txt")
+                    if str(f) != current_file
+                ]
+                if stale:
+                    for f in stale:
+                        f.unlink(missing_ok=True)
+                    logs += f"Cleaned {len(stale)} stale file(s) from upload dir.\n"
+                    log_box.code(logs, language="text")
+
+        # Create output dirs
         for d in [
             kw_cfg["output_dir"],
             query_cfg["query_output_dir"],
@@ -384,14 +552,93 @@ def render_global_run_all():
         ]:
             Path(d).mkdir(parents=True, exist_ok=True)
 
-        run_step("Keyword extraction", keyword_cmd)
-        run_step("Build query", query_cmd)
-        run_step("Search URLs", search_cmd)
-        run_step("Fetch pages", crawl_cmd)
-        run_step("Export clean TXT", export_cmd)
-        run_step("Generate VI embeddings", embed_vi_cmd)
-        run_step("Generate ZH embeddings", embed_zh_cmd)
-        run_step("Aligner", align_cmd)
+        # Stage 1: Keyword extraction — in-process with cached models
+        from lib.web.VnKeywordExtractor import VnKeywordExtractor, run_keyword_extraction
+        vncorenlp_dir = str(Path.home() / ".cache" / "vncorenlp")
+        annotator, ner_pipe, sbert = _load_keyword_models(
+            kw_cfg["ner_model_name"],
+            kw_cfg["sbert_model_name"],
+            vncorenlp_dir,
+        )
+        kw_extractor = VnKeywordExtractor(
+            annotator=annotator,
+            ner_pipeline=ner_pipe,
+            sbert=sbert,
+            stopwords=_load_stopwords(kw_cfg.get("stopwords_path", "")),
+        )
+        kw_input_files = collect_txt_files(kw_cfg)
+        run_step_inprocess(
+            "Keyword extraction",
+            run_keyword_extraction,
+            n_docs=len(kw_input_files),
+            extractor=kw_extractor,
+            input_files=kw_input_files,
+            output_dir=Path(kw_cfg["output_dir"]),
+            verbose=kw_cfg.get("verbose", True),
+        )
+
+        n_query = len(collect_json_files(kw_cfg["output_dir"]))
+        run_step("Build query", query_cmd, n_docs=n_query)
+
+        n_urls = len(collect_json_files(query_cfg["query_output_dir"]))
+        run_step("Search URLs", search_cmd, n_docs=n_urls)
+
+        n_pages = len(collect_json_files(search_crawl_cfg["url_dir"]))
+        run_step("Fetch pages", crawl_cmd, n_docs=n_pages)
+
+        n_clean = len(collect_json_files(search_crawl_cfg["page_dir"]))
+        run_step("Export clean TXT", export_cmd, n_docs=n_clean)
+
+        # Stage 5a & 5b: Embeddings — in-process with cached model
+        from lib.aligner.generate_embeddings import run_embedding_generation
+        emb_model = _load_embedding_model(eea_cfg["embedding_model_name"])
+        normalize_flag = eea_cfg.get("normalize_embeddings", True)
+
+        n_vi = len(list(Path(eea_cfg["vi_input_dir"]).glob("*.txt")))
+        run_step_inprocess(
+            "Generate VI embeddings",
+            run_embedding_generation,
+            n_docs=n_vi,
+            model=emb_model,
+            input_dir=eea_cfg["vi_input_dir"],
+            output_dir=eea_cfg["emb_base_path"],
+            lang="vi",
+            split_mode=eea_cfg.get("split_mode", "sentence"),
+            batch_size=eea_cfg.get("batch_size", 128),
+            normalize_embeddings=normalize_flag,
+            process_mode=eea_cfg.get("process_mode", "per_batch"),
+            encode_group_size=eea_cfg.get("encode_group_size", 4096),
+            num_of_sent=eea_cfg.get("num_of_sent", 8),
+            overlap_sent=eea_cfg.get("overlap_sent", 2),
+            max_sent_len=eea_cfg.get("max_sent_len", 10000),
+            chunk_size=eea_cfg.get("chunk_size", 100),
+            overlap_rate=eea_cfg.get("overlap_rate", 0.5),
+            max_tokens=eea_cfg.get("max_tokens"),
+        )
+
+        n_zh = len(list(Path(eea_cfg["txt_output_dir"]).glob("*.txt")))
+        run_step_inprocess(
+            "Generate ZH embeddings",
+            run_embedding_generation,
+            n_docs=n_zh,
+            model=emb_model,
+            input_dir=eea_cfg["txt_output_dir"],
+            output_dir=eea_cfg["emb_base_path"],
+            lang="zh",
+            split_mode=eea_cfg.get("split_mode", "sentence"),
+            batch_size=eea_cfg.get("batch_size", 128),
+            normalize_embeddings=normalize_flag,
+            process_mode=eea_cfg.get("process_mode", "per_batch"),
+            encode_group_size=eea_cfg.get("encode_group_size", 4096),
+            num_of_sent=eea_cfg.get("num_of_sent", 8),
+            overlap_sent=eea_cfg.get("overlap_sent", 2),
+            max_sent_len=eea_cfg.get("max_sent_len", 10000),
+            chunk_size=eea_cfg.get("chunk_size", 100),
+            overlap_rate=eea_cfg.get("overlap_rate", 0.5),
+            max_tokens=eea_cfg.get("max_tokens"),
+        )
+
+        run_step("Aligner", align_cmd, n_docs=n_vi)
 
         result_dir = make_alignment_result_package(
             align_output_dir=eea_cfg["align_output_dir"],
@@ -406,6 +653,19 @@ def render_global_run_all():
         st.session_state["global_result_dir"] = str(result_dir)
         st.session_state["global_result_zip_path"] = str(result_zip)
         st.session_state["global_intermediate_zip_path"] = str(intermediate_zip)
+
+        # Auto-release the embedding model (LaBSE ~13 GB) to free VRAM.
+        # Keyword models (ELECTRA, SBERT, VnCoreNLP) are kept cached because
+        # VnCoreNLP has a slow JVM startup and the models are much smaller.
+        _load_embedding_model.clear()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        st.info("Embedding model released from GPU (VRAM freed). "
+                "Keyword models remain cached for faster re-runs.")
 
         st.success("Global pipeline finished.")
         render_global_downloads()
@@ -448,6 +708,7 @@ def init_state():
     st.session_state.setdefault("global_result_dir", "")
     st.session_state.setdefault("global_result_zip_path", "")
     st.session_state.setdefault("global_intermediate_zip_path", "")
+    st.session_state.setdefault("pipeline_timings", [])
     st.session_state.setdefault("eea_result_dir", "")
     st.session_state.setdefault("eea_result_zip_path", "")
 

@@ -9,7 +9,7 @@ matplotlib
 langchain_text_splitters
 google-generativeai
 python-dotenv
-requests
+aiohttp
 trafilatura
 beautifulsoup4
 lxml

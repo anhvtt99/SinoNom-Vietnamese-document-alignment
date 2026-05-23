@@ -1216,5 +1216,66 @@ def main():
             print(f"Saved to: {filepath}")
 
 
+def run_keyword_extraction(
+    extractor: "VnKeywordExtractor",
+    input_files: List[Path],
+    output_dir: Path,
+    top_n: int = 15,
+    min_n: int = 1,
+    max_n: int = 1,
+    diversity: float = 0.4,
+    verbose: bool = False,
+) -> None:
+    """
+    In-process entry point — models passed in pre-loaded.
+    Same logic as main() without the model-loading block.
+    Designed to be called from Streamlit using @st.cache_resource models.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if verbose:
+        print(f"Found {len(input_files)} input file(s)")
+
+    for input_path in input_files:
+        doc_id = input_path.stem
+
+        with input_path.open("r", encoding="utf-8") as f:
+            text = f.read().strip()
+
+        cleaned = _clean_text(text)
+
+        chunk_kws = extractor.extract(
+            cleaned,
+            top_n=top_n,
+            ngram_range=(min_n, max_n),
+            diversity=diversity,
+            verbose=verbose,
+            aggregate=False,
+            return_chunks=False,
+        )
+
+        data = {
+            "doc_id": doc_id,
+            "chunks": [],
+        }
+
+        for idx, kw_list in enumerate(chunk_kws):
+            data["chunks"].append({
+                "chunk_id": idx,
+                "keywords": [
+                    {"word": kw, "score": score, "pos": pos}
+                    for kw, score, pos in kw_list
+                ],
+            })
+
+        filepath = output_dir / f"{doc_id}.json"
+        with filepath.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        if verbose:
+            print(f"Saved to: {filepath}")
+
+
 if __name__ == "__main__":
     main()

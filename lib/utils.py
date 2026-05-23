@@ -95,7 +95,7 @@ class AlignerIO:
             if emb_file_path.exists():
                 results[idx] = np.load(emb_file_path).astype('float32')
             else:
-                print(f"Warning: File {emb_file_path} không tồn tại.")
+                print(f"Warning: File {emb_file_path} not found.")
         
         return results
 
