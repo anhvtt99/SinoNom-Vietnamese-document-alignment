@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from lib.utils import random_sleep_seconds
-from lib.web.VnKeywordExtractor import VnKeywordExtractor
+from lib.extract.VnKeywordExtractor import VnKeywordExtractor
 from lib.web.wikisource_reranker import (
     score_anchor_candidates,
     get_wikisource_stats,

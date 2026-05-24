@@ -150,6 +150,26 @@ def normalize_vietnamese_phrase(text: str) -> str:
     return " ".join(text.split())
 
 # -----------------------
+# Helpers: function for normalization classical chinese word
+# -----------------------
+def normalize_chinese_phrase(text: str) -> str:
+    """
+    Normalize Chinese keyword text for stable comparison.
+    Notes:
+        - NFC normalize (combine diacritics / variation selectors)
+        - remove zero-width characters
+        - remove all whitespace (Chinese has no word boundary)
+    """
+    import re
+    import unicodedata
+
+    text = str(text or "").strip()
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"[​‌‍﻿]", "", text)
+    text = re.sub(r"\s+", "", text)
+    return text
+
+# -----------------------
 # Helpers: sleep timing
 # -----------------------
 def random_sleep_seconds(seconds_range: Tuple[float, float]) -> float:

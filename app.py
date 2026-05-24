@@ -64,7 +64,7 @@ def _load_keyword_models(ner_model_name: str, sbert_model_name: str, vncorenlp_d
 @st.cache_resource
 def _load_stopwords(stopwords_path: str) -> frozenset:
     """Load stopwords once and cache."""
-    from lib.web.VnKeywordExtractor import normalize_vietnamese_phrase
+    from lib.extract.VnKeywordExtractor import normalize_vietnamese_phrase
     path = Path(stopwords_path)
     if not path.exists():
         return frozenset()
@@ -553,7 +553,7 @@ def render_global_run_all():
             Path(d).mkdir(parents=True, exist_ok=True)
 
         # Stage 1: Keyword extraction — in-process with cached models
-        from lib.web.VnKeywordExtractor import VnKeywordExtractor, run_keyword_extraction
+        from lib.extract.VnKeywordExtractor import VnKeywordExtractor, run_keyword_extraction
         vncorenlp_dir = str(Path.home() / ".cache" / "vncorenlp")
         annotator, ner_pipe, sbert = _load_keyword_models(
             kw_cfg["ner_model_name"],

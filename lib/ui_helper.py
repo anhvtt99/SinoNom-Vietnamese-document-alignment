@@ -49,7 +49,7 @@ def collect_json_files(root_dir: str, recursive: bool = True) -> list[Path]:
 
 
 def build_keyword_command(cfg: dict) -> list[str]:
-    cmd = ["python", "-u", "-m", "lib.web.VnKeywordExtractor"]
+    cmd = ["python", "-u", "-m", "lib.extract.VnKeywordExtractor"]
 
     if cfg.get("input_mode") == UPLOAD_FILE_MODE:
         cmd.extend(["--input_path", cfg.get("uploaded_input_path", "")])
