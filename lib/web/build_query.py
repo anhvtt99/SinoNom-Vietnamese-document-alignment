@@ -136,6 +136,19 @@ def split_exact_and_loose_terms(
 
     return exact, loose
 
+def target_term_text(item: Dict[str, Any]) -> str:
+    """
+    Extract the target-language term used in the search query.
+
+    Underscores are converted to spaces so Vietnamese anchors (zh->vi) are
+    quoted as natural phrases, e.g. "Kinh Dương Vương" instead of
+    "Kinh_Dương_Vương". Han terms (vi->zh) have no underscores so this is a
+    no-op for that direction.
+    """
+    term = str(item.get("han_word", "") or item.get("trans", "")).strip()
+    return term.replace("_", " ").strip()
+
+
 def build_mixed_query(
     query_terms: List[Dict[str, Any]],
     num_exact_anchors: int = 3,
@@ -152,13 +165,13 @@ def build_mixed_query(
     parts = []
 
     for item in exact_items:
-        term = str(item.get("han_word", "") or item.get("trans", "")).strip()
+        term = target_term_text(item)
         if term:
             parts.append(f'"{term}"')
 
     if not anchor_only:
         for item in loose_items:
-            term = str(item.get("han_word", "") or item.get("trans", "")).strip()
+            term = target_term_text(item)
             if term:
                 parts.append(term)
 
@@ -206,6 +219,7 @@ def build_queries_for_keyword_file(
     output_path: Path,
     args,
     translator,
+    aggregate_fn,
     allowed_pos,
     preferred_exact_pos,
     sites,
@@ -249,7 +263,7 @@ def build_queries_for_keyword_file(
     # =========================================================================
     extended_global_top_n = args.top_n_keywords + args.min_total_query * args.num_query_terms
 
-    extended_global_kws = VnKeywordExtractor.aggregate(
+    extended_global_kws = aggregate_fn(
         chunk_keywords_for_agg,
         top_n=extended_global_top_n,
         rarity_bias=args.rarity_bias,
@@ -277,7 +291,7 @@ def build_queries_for_keyword_file(
 
             sub_chunk_keywords = chunk_keywords_for_agg[start_idx:end_idx]
 
-            local_kws = VnKeywordExtractor.aggregate(
+            local_kws = aggregate_fn(
                 sub_chunk_keywords,
                 top_n=args.top_n_keywords,
                 rarity_bias=args.rarity_bias,
@@ -511,6 +525,9 @@ def build_queries_for_keyword_file(
     # =========================================================================
     output = {
         "doc_id": doc_id,
+        "direction": args.direction,
+        "src_lang": args.src_lang,
+        "tgt_lang": args.tgt_lang,
         "source_keyword_path": str(keyword_path),
         "num_chunks": num_chunks,
         "use_local_query": args.use_local_query,
@@ -527,8 +544,32 @@ def build_queries_for_keyword_file(
         "use_site_restriction": args.use_site_restriction,
         "results": results,
     }
+
+    # By default, persist only the fields the next step (search_urls.py) reads:
+    # doc_id + results[].{query_id, query, rerank_source}, plus light traceability
+    # metadata. Use --full_output to keep all diagnostic fields (keywords,
+    # query_terms, pair_matrix, query_plan, per-group translation stats, etc.).
+    if getattr(args, "full_output", False):
+        final_output = output
+    else:
+        final_output = {
+            "doc_id": output["doc_id"],
+            "direction": output["direction"],
+            "src_lang": output["src_lang"],
+            "tgt_lang": output["tgt_lang"],
+            "source_keyword_path": output["source_keyword_path"],
+            "results": [
+                {
+                    "query_id": item.get("query_id", ""),
+                    "query": item.get("query", ""),
+                    "rerank_source": item.get("rerank_source", ""),
+                }
+                for item in results
+            ],
+        }
+
     with output_path.open("w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+        json.dump(final_output, f, ensure_ascii=False, indent=2)
 
     if args.verbose:
         print(f"Saved query file to: {output_path}")
@@ -550,10 +591,20 @@ def main():
         help="Recursively search JSON files in --input_dir",
     )
 
-    # Translation cache
-    parser.add_argument("--src_lang", type=str, default="vi")
-    parser.add_argument("--tgt_lang", type=str, default="zh")
-    parser.add_argument("--translation_cache_dir", type=str, default="./cache/translation")
+    # Direction: vi2zh (Quốc ngữ -> Hán) or zh2vi (Hán -> Quốc ngữ).
+    # Drives src/tgt lang, aggregator, default POS sets, and rerank corpus.
+    parser.add_argument(
+        "--direction",
+        type=str,
+        default="vi2zh",
+        choices=["vi2zh", "zh2vi"],
+        help="Translation/search direction. vi2zh: VN->Han. zh2vi: Han->VN.",
+    )
+
+    # Translation cache. src/tgt are derived from --direction unless overridden.
+    parser.add_argument("--src_lang", type=str, default=None)
+    parser.add_argument("--tgt_lang", type=str, default=None)
+    parser.add_argument("--translation_cache_dir", type=str, default="./cache")
 
     # Keyword aggregation
     parser.add_argument(
@@ -607,8 +658,12 @@ def main():
     parser.add_argument(
         "--preferred_exact_pos",
         nargs="*",
-        default=["Np", "N"],
-        help="POS tags preferred for exact quoted anchors in the final query",
+        default=None,
+        help=(
+            "POS tags preferred for exact quoted anchors. "
+            "Defaults per direction: vi2zh=[Np,N] (VnCoreNLP), "
+            "zh2vi=[PROPN,NOUN] (UD)."
+        ),
     )
 
     # Translation config
@@ -649,8 +704,11 @@ def main():
     parser.add_argument(
         "--allowed_pos",
         nargs="*",
-        default=["Np", "N"],
-        help="POS tags used only when --use_wikisource_rerank is enabled",
+        default=None,
+        help=(
+            "POS tags eligible for rerank, used only when --use_wikisource_rerank "
+            "is enabled. Defaults per direction: vi2zh=[Np,N], zh2vi=[PROPN,NOUN]."
+        ),
     )
     parser.add_argument(
         "--wikisource_rerank_scope",
@@ -679,6 +737,15 @@ def main():
         help="Domain-restricted search sites; only used when --use_site_restriction is set",
     )
 
+    parser.add_argument(
+        "--full_output",
+        action="store_true",
+        help=(
+            "Persist all diagnostic fields (keywords, query_terms, pair_matrix, "
+            "query_plan, etc.). Default keeps only fields the next step needs."
+        ),
+    )
+
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -691,6 +758,42 @@ def main():
 
     if args.input_dir and not args.output_dir:
         raise ValueError("--output_dir is required when using --input_dir")
+
+    # -------------------------------------------------------------------------
+    # Resolve direction-dependent settings.
+    # -------------------------------------------------------------------------
+    DIRECTION_LANGS = {
+        "vi2zh": ("vi", "zh"),
+        "zh2vi": ("zh", "vi"),
+    }
+    DIRECTION_DEFAULT_POS = {
+        "vi2zh": ["Np", "N"],        # VnCoreNLP tags (source = Vietnamese)
+        "zh2vi": ["PROPN", "NOUN"],  # Universal Dependencies tags (source = Han)
+    }
+    # Co-occurrence rerank corpus per direction.
+    #   vi2zh: classical Han corpus (zh.wikisource) — None means use env/default.
+    #   zh2vi: rich modern Vietnamese corpus (vi.wikipedia), since vi.wikisource
+    #          is too sparse for historical-term co-occurrence.
+    DIRECTION_RERANK_API = {
+        "vi2zh": None,
+        "zh2vi": "https://vi.wikipedia.org/w/api.php",
+    }
+
+    default_src, default_tgt = DIRECTION_LANGS[args.direction]
+    args.src_lang = args.src_lang or default_src
+    args.tgt_lang = args.tgt_lang or default_tgt
+
+    if args.allowed_pos is None:
+        args.allowed_pos = DIRECTION_DEFAULT_POS[args.direction]
+    if args.preferred_exact_pos is None:
+        args.preferred_exact_pos = DIRECTION_DEFAULT_POS[args.direction]
+
+    # Aggregator must match the source language's normalization rules.
+    if args.direction == "zh2vi":
+        from lib.extract.ZhKeywordExtractor import ZhKeywordExtractor
+        aggregate_fn = ZhKeywordExtractor.aggregate
+    else:
+        aggregate_fn = VnKeywordExtractor.aggregate
 
     translation_backend = "gemini" if args.translate_gemini else "cache"
 
@@ -712,17 +815,24 @@ def main():
     }
 
     if args.use_wikisource_rerank:
-        init_wikisource_session(verbose=args.verbose)
+        init_wikisource_session(
+            verbose=args.verbose,
+            api_url=DIRECTION_RERANK_API[args.direction],
+        )
         if args.verbose:
             auth_status = get_wikisource_auth_status()
             mode = "bot" if auth_status["logged_in"] else "anonymous"
-            print(f"[Wikisource auth] mode={mode}, user={auth_status['username']}")
+            print(
+                f"[Rerank corpus] direction={args.direction}, "
+                f"api={auth_status['api']}, mode={mode}, user={auth_status['username']}"
+            )
     if args.keyword_path:
         build_queries_for_keyword_file(
             keyword_path=Path(args.keyword_path),
             output_path=Path(args.output_path),
             args=args,
             translator=translator,
+            aggregate_fn=aggregate_fn,
             allowed_pos=allowed_pos,
             preferred_exact_pos=preferred_exact_pos,
             sites=sites,
@@ -756,6 +866,7 @@ def main():
                 output_path=out_path,
                 args=args,
                 translator=translator,
+                aggregate_fn=aggregate_fn,
                 allowed_pos=allowed_pos,
                 preferred_exact_pos=preferred_exact_pos,
                 sites=sites,

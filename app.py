@@ -1,5 +1,7 @@
 import contextlib
 import io
+import json
+import shutil
 import time
 from pathlib import Path
 
@@ -93,6 +95,8 @@ st.set_page_config(
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR
 INTERMEDIATE_DIR = PROJECT_DIR / "intermediate_result"
+RUN_DIR   = INTERMEDIATE_DIR / "run"      # cleaned before every "Run ALL"
+CACHE_DIR = PROJECT_DIR / "cache"         # persists across all runs
 
 def make_keyword_defaults(project_dir: Path) -> dict:
     return {
@@ -100,7 +104,7 @@ def make_keyword_defaults(project_dir: Path) -> dict:
         "uploaded_input_path": "",
         "input_dir": str(project_dir / "data/In/Txt_Viet/Viet_chapters"),
         "upload_dir": str(project_dir / "ui_uploads"),
-        "output_dir": str(INTERMEDIATE_DIR / "keyword"),
+        "output_dir": str(RUN_DIR / "keyword"),
         "ner_model_name": "NlpHUST/ner-vietnamese-electra-base",
         "sbert_model_name": "bkai-foundation-models/vietnamese-bi-encoder",
         "stopwords_path": str(project_dir / "lib/resources/stopwords_vi.txt"),
@@ -109,11 +113,10 @@ def make_keyword_defaults(project_dir: Path) -> dict:
 
 
 def make_query_defaults(keyword_output_dir: str) -> dict:
-    run_root = Path(keyword_output_dir).parent
     return {
         "keyword_input_dir": keyword_output_dir,
-        "query_output_dir": str(run_root / "queries"),
-        "translation_cache_dir": str(run_root / "cache/translation"),
+        "query_output_dir": str(RUN_DIR / "queries"),
+        "translation_cache_dir": str(CACHE_DIR),
         "translate_gemini": True,
         "gemini_model_name": "models/gemini-2.5-pro",
         "translation_batch_size": 50,
@@ -132,12 +135,10 @@ def make_query_defaults(keyword_output_dir: str) -> dict:
     }
 
 def make_search_crawl_defaults(query_output_dir: str) -> dict:
-    run_root = Path(query_output_dir).parent
-
     return {
         "query_dir": query_output_dir,
-        "url_dir": str(run_root / "urls"),
-        "page_dir": str(run_root / "pages"),
+        "url_dir": str(RUN_DIR / "urls"),
+        "page_dir": str(RUN_DIR / "pages"),
 
         "search_backend": "serper",
         "num_results": 10,
@@ -152,11 +153,9 @@ def make_search_crawl_defaults(query_output_dir: str) -> dict:
     }
 
 def make_export_embed_align_defaults(page_dir: str) -> dict:
-    run_root = Path(page_dir).parent
-
     return {
         "page_dir": page_dir,
-        "txt_output_dir": str(run_root / "corpus_txt"),
+        "txt_output_dir": str(RUN_DIR / "corpus_txt"),
 
         # VI source TXT should usually be the original input dir from Tab 1
         "use_tab1_vi_input": True,
@@ -166,8 +165,8 @@ def make_export_embed_align_defaults(page_dir: str) -> dict:
         "max_file_size": "5MB",
 
         # embedding + align
-        "emb_base_path": str(run_root / "embeddings"),
-        "align_output_dir": str(run_root / "align_results"),
+        "emb_base_path": str(RUN_DIR / "embeddings"),
+        "align_output_dir": str(RUN_DIR / "align_results"),
 
         "embedding_model_name": "sentence-transformers/LaBSE",
         "process_mode": "per_batch",
@@ -198,14 +197,8 @@ def get_tab1_vi_input_dir() -> str:
     kw_cfg = st.session_state.get("kw_config", {})
 
     if kw_cfg.get("input_mode") == UPLOAD_FILE_MODE:
-        uploaded_path = kw_cfg.get("uploaded_input_path", "")
-        if uploaded_path:
-            return str(Path(uploaded_path).parent)
-
-        return kw_cfg.get(
-            "upload_dir",
-            str(PROJECT_DIR / "ui_uploads"),
-        )
+        # Uploaded file is copied into RUN_DIR/input/ at the start of each run.
+        return str(RUN_DIR / "input")
 
     return kw_cfg.get(
         "input_dir",
@@ -407,7 +400,7 @@ def render_global_run_all():
     align_cmd = build_aligner_command(eea_cfg)
 
     st.subheader("Global Run All")
-    st.info(f"Intermediate dir: {INTERMEDIATE_DIR}")
+    st.info(f"Run dir: {RUN_DIR}  |  Cache dir: {CACHE_DIR}")
 
     with st.expander("Global command preview", expanded=False):
         st.markdown("**1. Keyword extraction**")
@@ -512,34 +505,48 @@ def render_global_run_all():
             _record(title, duration, ok, n_docs)
 
     try:
-        if kw_cfg.get("input_mode") == UPLOAD_FILE_MODE and not kw_cfg.get("uploaded_input_path"):
-            st.error("Upload mode is active but no file has been uploaded yet.")
-            st.stop()
-
-        if kw_cfg.get("input_mode") == INPUT_DIR_MODE and not Path(kw_cfg["input_dir"]).exists():
-            st.error(f"Input directory not found: {kw_cfg['input_dir']}")
-            st.stop()
-
-        if not Path(eea_cfg["vi_input_dir"]).exists():
-            st.error(f"Vietnamese source dir not found: {eea_cfg['vi_input_dir']}")
-            st.stop()
-
-        # --- Q2: clean stale files from upload dir before processing ---
+        # --- Validate inputs ---
         if kw_cfg.get("input_mode") == UPLOAD_FILE_MODE:
-            upload_dir = Path(kw_cfg.get("upload_dir", ""))
-            current_file = kw_cfg.get("uploaded_input_path", "")
-            if upload_dir.exists():
-                stale = [
-                    f for f in upload_dir.glob("*.txt")
-                    if str(f) != current_file
-                ]
-                if stale:
-                    for f in stale:
-                        f.unlink(missing_ok=True)
-                    logs += f"Cleaned {len(stale)} stale file(s) from upload dir.\n"
-                    log_box.code(logs, language="text")
+            if not kw_cfg.get("uploaded_input_path"):
+                st.error("Upload mode is active but no file has been uploaded yet.")
+                st.stop()
+        else:
+            if not Path(kw_cfg["input_dir"]).exists():
+                st.error(f"Input directory not found: {kw_cfg['input_dir']}")
+                st.stop()
+            if not Path(eea_cfg["vi_input_dir"]).exists():
+                st.error(f"Vietnamese source dir not found: {eea_cfg['vi_input_dir']}")
+                st.stop()
 
-        # Create output dirs
+        # --- Clean RUN_DIR entirely for a fresh start ---
+        if RUN_DIR.exists():
+            shutil.rmtree(RUN_DIR, ignore_errors=True)
+        logs += f"Cleaned run directory: {RUN_DIR}\n"
+        log_box.code(logs, language="text")
+
+        # --- Upload mode: copy file into RUN_DIR/input/, then clear ui_uploads/ ---
+        if kw_cfg.get("input_mode") == UPLOAD_FILE_MODE:
+            run_input_dir = RUN_DIR / "input"
+            run_input_dir.mkdir(parents=True, exist_ok=True)
+
+            src_path = Path(kw_cfg["uploaded_input_path"])
+            dest_path = run_input_dir / src_path.name
+            shutil.copy2(src_path, dest_path)
+
+            # Point the pipeline at the new location
+            kw_cfg["uploaded_input_path"] = str(dest_path)
+            eea_cfg["vi_input_dir"] = str(run_input_dir)
+
+            # Clear ui_uploads/ — file is now safely in run/input/
+            upload_dir = Path(kw_cfg.get("upload_dir", str(PROJECT_DIR / "ui_uploads")))
+            if upload_dir.exists():
+                for f in upload_dir.glob("*.txt"):
+                    f.unlink(missing_ok=True)
+
+            logs += f"Copied input file to: {dest_path}\n"
+            log_box.code(logs, language="text")
+
+        # --- Create all output dirs (cache persists, run dirs are freshly created) ---
         for d in [
             kw_cfg["output_dir"],
             query_cfg["query_output_dir"],
@@ -647,8 +654,14 @@ def render_global_run_all():
             page_dir=search_crawl_cfg["page_dir"],
         )
 
+        # --- Persist timings to disk so they're included in the archive ---
+        timings_path = RUN_DIR / "timings.json"
+        timings_path.parent.mkdir(parents=True, exist_ok=True)
+        with timings_path.open("w", encoding="utf-8") as _tf:
+            json.dump(timings, _tf, ensure_ascii=False, indent=2)
+
         result_zip = make_zip_from_dir(result_dir)
-        intermediate_zip = make_zip_from_dir(INTERMEDIATE_DIR)
+        intermediate_zip = make_zip_from_dir(RUN_DIR)
 
         st.session_state["global_result_dir"] = str(result_dir)
         st.session_state["global_result_zip_path"] = str(result_zip)
@@ -692,7 +705,7 @@ def init_state():
     if "export_embed_align_config" not in st.session_state:
         page_dir = st.session_state.get("search_crawl_config", {}).get(
             "page_dir",
-            str(INTERMEDIATE_DIR / "pages"),
+            str(RUN_DIR / "pages"),
         )
         st.session_state["export_embed_align_config"] = make_export_embed_align_defaults(page_dir)
     
@@ -933,8 +946,6 @@ def render_build_queries_tab():
         "keyword_input_dir": keyword_input_dir, 
     }
 
-    default_run_root = Path(keyword_input_dir).parent
-
     col1, col2 = st.columns([2, 1])
 
     with col1:
@@ -946,7 +957,7 @@ def render_build_queries_tab():
             "Query output directory",
             value=query_cfg_prev.get(
                 "query_output_dir",
-                str(default_run_root / "queries"),
+                str(RUN_DIR / "queries"),
             ),
             key="query_output_dir",
         )
@@ -955,7 +966,7 @@ def render_build_queries_tab():
             "Translation cache directory",
             value=query_cfg_prev.get(
                 "translation_cache_dir",
-                str(default_run_root / "cache/translation"),
+                str(CACHE_DIR),
             ),
             key="query_translation_cache_dir",
         )
@@ -1199,7 +1210,7 @@ def render_search_crawl_tab():
 
     query_dir = st.session_state.get("query_config", {}).get(
         "query_output_dir",
-        str(INTERMEDIATE_DIR / "queries"),
+        str(RUN_DIR / "queries"),
     )
 
     search_defaults = make_search_crawl_defaults(query_dir)
@@ -1504,7 +1515,7 @@ def render_export_embed_align_tab():
 
     page_dir = st.session_state.get("search_crawl_config", {}).get(
         "page_dir",
-        str(INTERMEDIATE_DIR / "pages"),
+        str(RUN_DIR / "pages"),
     )
 
     defaults = make_export_embed_align_defaults(page_dir)

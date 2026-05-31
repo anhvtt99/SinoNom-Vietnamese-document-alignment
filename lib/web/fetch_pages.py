@@ -528,6 +528,7 @@ async def fetch_one_url_file_async(
     retry_backoff: float = DEFAULT_RETRY_BACKOFF,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     skip_existing: bool = True,
+    full_output: bool = False,
     verbose: bool = False,
 ) -> None:
     if skip_existing and output_path.exists():
@@ -631,8 +632,32 @@ async def fetch_one_url_file_async(
         "pages": pages,
     }
 
+    # By default, persist only the page fields the next step (export_clean_txt.py)
+    # reads, plus light traceability metadata. Drop snippet/source_block,
+    # http_status, content_type, text_len and assets (recomputed or unused
+    # downstream). Use --full_output to keep everything.
+    if full_output:
+        final_output = output
+    else:
+        minimal_page_fields = (
+            "page_id", "doc_id",
+            "url", "canonical_url", "final_url", "domain",
+            "title", "html_title",
+            "status", "content_kind", "extractor",
+            "needs_ocr", "error",
+            "source_queries", "text",
+        )
+        final_output = {
+            "doc_id": doc_id,
+            "source_url_path": str(url_path),
+            "pages": [
+                {k: page.get(k) for k in minimal_page_fields}
+                for page in pages
+            ],
+        }
+
     with output_path.open("w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+        json.dump(final_output, f, ensure_ascii=False, indent=2)
 
     if verbose:
         print(f"\nSaved fetched pages to: {output_path}")
@@ -670,6 +695,7 @@ async def _async_main(args: argparse.Namespace) -> None:
             retry_backoff=args.retry_backoff,
             max_concurrent=args.max_concurrent,
             skip_existing=skip_existing,
+            full_output=args.full_output,
             verbose=args.verbose,
         )
     else:
@@ -707,6 +733,7 @@ async def _async_main(args: argparse.Namespace) -> None:
                     retry_backoff=args.retry_backoff,
                     max_concurrent=args.max_concurrent,
                     skip_existing=skip_existing,
+                    full_output=args.full_output,
                     verbose=args.verbose,
                 )
 
@@ -783,6 +810,15 @@ def main():
         "--force",
         action="store_true",
         help="Re-fetch even if the output file already exists (default: skip existing)",
+    )
+
+    parser.add_argument(
+        "--full_output",
+        action="store_true",
+        help=(
+            "Persist all page fields and document counters. Default keeps only "
+            "the fields the next step (export_clean_txt.py) reads."
+        ),
     )
 
     parser.add_argument("--verbose", action="store_true")

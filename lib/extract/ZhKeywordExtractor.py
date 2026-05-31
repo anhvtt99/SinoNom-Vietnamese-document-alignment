@@ -3,7 +3,7 @@ Classical Chinese keyword extraction using:
 1. text chunking,
 2. clause splitting (Chinese punctuation),
 3. Universal Dependencies (UD) parsing per clause,
-4. dependency-based span merging (segmentation),
+4. CoNLL-U token extraction (no custom merging — pipeline handles segmentation),
 5. n-gram candidate generation,
 6. embedding-based ranking,
 7. optional cross-chunk aggregation.
@@ -16,8 +16,6 @@ This class mirrors the public API of VnKeywordExtractor so that downstream
 modules (build_query.py, etc.) can consume both extractors uniformly.
 """
 
-import os
-import argparse
 import json
 import re
 import unicodedata
@@ -29,11 +27,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Model
-from transformers import pipeline as hf_pipeline
-from sentence_transformers import SentenceTransformer
-
-from lib.utils import normalize_chinese_phrase, cuda_available
+from lib.utils import normalize_chinese_phrase
 
 
 # =============================================================================
@@ -48,8 +42,7 @@ TokenRecord = Dict[str, Any]
 
 
 # =============================================================================
-# DATACLASSES FOR CONLL-U PARSING
-# (kept at module level by Python convention — they are types, not behavior)
+# DATACLASS FOR CONLL-U PARSING
 # =============================================================================
 
 @dataclass
@@ -65,68 +58,33 @@ class Tok:
     misc: str
 
 
-@dataclass
-class MergeSpan:
-    start_id: int
-    end_id: int
-    text: str
-    rule: str
-    upos: str
-    head_id: int
-    head_form: str
-
-
-# =============================================================================
-# CONSTANTS FOR SPAN MERGING
-# (kept at module level — data, not behavior)
-# =============================================================================
-
-ALLOWED_MERGE_UPOS = {"NOUN", "PROPN", "X", "ADJ", "NUM"}
-ALLOWED_LEFT_DEPREL = {"nmod", "amod", "compound", "flat", "goeswith", "nummod"}
-
-
 # =============================================================================
 # MAIN CLASS
 # =============================================================================
 
 class ZhKeywordExtractor:
     """
-    Classical Chinese keyword extractor based on UD parsing + sentence embeddings.
+    Classical Chinese keyword extractor based on UD pipeline + sentence embeddings.
 
     High-level pipeline:
-        1. Split a long document into chunks (sized for BERT 512-token limit).
+        1. Split a long document into chunks.
         2. Split each chunk into clauses by Chinese punctuation.
-        3. Run UD parsing on each clause -> CoNLL-U string.
-        4. Apply dependency-based span merging -> multi-character tokens.
-        5. Generate n-gram candidates per clause (no cross-boundary n-grams).
+        3. Run the UD pipeline on each clause -> CoNLL-U string.
+        4. Convert CoNLL-U tokens into token records.
+        5. Generate n-gram candidates per clause, no cross-boundary n-grams.
         6. Filter by POS and stopwords.
         7. Rank candidates by cosine similarity or MMR against the chunk text.
         8. Optionally aggregate chunk-level keywords into document-level keywords.
-
-    Public API (matches VnKeywordExtractor):
-        - extract(text, ...)              -> document-level keyword extraction
-        - extract_chunks(chunks, ...)     -> chunk-level keyword extraction
-        - aggregate(chunk_keywords, ...)  -> merge chunk-level keyword lists
-        - save_keywords / load_keywords   -> persist extracted keywords
-
-    Public static utilities (segmenter + text cleaning):
-        - parse_conllu, make_span, build_children, is_contiguous
-        - get_local_modifier_head_spans, get_goeswith_flat_spans, get_conj_pair_spans
-        - select_non_overlapping_spans, apply_spans_to_token_records
-        - segment_from_conllu
-        - clean_han_light, split_chunk_to_clauses
     """
 
-    # Universal Dependencies POS tags (mapped from VnCore equivalents):
-    #   N  -> NOUN
-    #   Np -> PROPN
-    #   V  -> VERB
-    #   A  -> ADJ
     DEFAULT_POS_TAGS = ["NOUN", "PROPN", "VERB", "ADJ"]
     FORBIDDEN_POS_TAGS = {"PUNCT", "X", "SYM"}
 
-    # Punctuation used to split a chunk into clauses.
-    CLAUSE_SPLIT_PUNCT = "\n，。；：！？、〈〉《》（）()「」『』"
+    # Include ASCII punctuation too, because crawled/web text may mix them.
+    # NOTE: ASCII period '.' is intentionally excluded — it appears in decimal
+    # numbers (1.5), version strings (v3.1), and abbreviations, and would cause
+    # incorrect clause splits on those patterns.
+    CLAUSE_SPLIT_PUNCT = "\n，,。;；:：！？!?、〈〉《》（）()「」『』"
 
     def __init__(
         self,
@@ -134,27 +92,32 @@ class ZhKeywordExtractor:
         sbert,
         stopwords: Optional[set] = None,
         chunk_size: int = 400,
-        chunk_overlap: int = 50,
+        chunk_overlap: int = 20,
         keep_pos_tags: Optional[List[str]] = None,
+        sbert_batch_size: int = 32,
+        nlp_batch_size: int = 128,
     ):
         """
         Args:
             nlp_pipeline:
-                A HuggingFace `universal-dependencies` pipeline that returns
-                CoNLL-U formatted strings when called on text.
+                HuggingFace universal-dependencies pipeline returning CoNLL-U strings.
             sbert:
-                A SentenceTransformer-like embedding model (e.g., BGE-zh).
+                SentenceTransformer-like embedding model.
             stopwords:
-                Stopword set used to reject weak candidates. Should already be
-                normalized via `normalize_chinese_phrase`.
+                Normalized Chinese stopword set.
             chunk_size:
-                Maximum chunk length in characters. Default 400 keeps each chunk
-                safely under the typical 512-token BERT limit (1 char ~ 1 token
-                for classical Chinese).
+                Maximum chunk length in characters.
             chunk_overlap:
                 Character overlap between adjacent chunks.
             keep_pos_tags:
                 UD POS tags allowed at candidate boundaries.
+            sbert_batch_size:
+                Batch size for candidate embedding.
+            nlp_batch_size:
+                Maximum number of masked rows packed into a single UD forward
+                pass. The goeswith pipeline parses one clause by masking each
+                token in turn (n tokens -> n rows), so this bounds how many such
+                rows from across clauses we batch onto the GPU at once.
         """
         self.nlp = nlp_pipeline
         self.sbert = sbert
@@ -162,6 +125,8 @@ class ZhKeywordExtractor:
         self.stopwords = stopwords or set()
         self.chunk_size = chunk_size
         self.keep_pos_tags = keep_pos_tags or self.DEFAULT_POS_TAGS
+        self.sbert_batch_size = sbert_batch_size
+        self.nlp_batch_size = nlp_batch_size
 
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -187,16 +152,12 @@ class ZhKeywordExtractor:
         return_chunks: bool = False,
         verbose: bool = False,
     ) -> Union[List[Keyword], List[List[Keyword]], Dict]:
-        """
-        Extract keywords from a full document.
-
-        Args mirror VnKeywordExtractor.extract for cross-language API parity.
-        """
         if not text or not text.strip():
             empty = {"chunks": [], "chunk_keywords": [], "keywords": []}
             return empty if return_chunks else []
 
         chunks = self._split_text(text)
+
         if verbose:
             print(f"📚 Split into {len(chunks)} chunks")
 
@@ -233,7 +194,6 @@ class ZhKeywordExtractor:
         use_mmr: bool = True,
         verbose: bool = False,
     ) -> List[List[Keyword]]:
-        """Extract keywords from a list of pre-split chunks."""
         if not chunks:
             return []
 
@@ -250,6 +210,7 @@ class ZhKeywordExtractor:
                 diversity=diversity,
                 use_mmr=use_mmr,
             )
+
             results.append(keywords)
 
             if verbose:
@@ -268,19 +229,12 @@ class ZhKeywordExtractor:
         rarity_bias: float = 0.5,
         rank_weight: float = 0.1,
     ) -> List[Keyword]:
-        """
-        Merge chunk-level keyword lists into a document-level ranking.
-
-        Logic mirrors VnKeywordExtractor.aggregate. The only difference is
-        that we use `normalize_chinese_phrase` to group equivalent forms.
-        """
         if not chunk_keywords:
             return []
 
         total_chunks = len(chunk_keywords)
         normalize = normalize_chinese_phrase
 
-        # Step 1: normalize scores inside each chunk
         normalized: List[Tuple[str, float, str]] = []
 
         for chunk in chunk_keywords:
@@ -300,12 +254,11 @@ class ZhKeywordExtractor:
         if not normalized:
             return []
 
-        # Step 2: group equivalent keyword forms
         groups: Dict[str, List[Tuple[str, float, str]]] = {}
+
         for kw, score, pos in normalized:
             groups.setdefault(normalize(kw), []).append((kw, score, pos))
 
-        # Step 3: compute quality and rarity signals
         raw: List[Tuple[str, float, float, str]] = []
 
         for versions in groups.values():
@@ -328,7 +281,6 @@ class ZhKeywordExtractor:
         quality_norm = minmax(np.array([q for _, q, _, _ in raw]))
         idf_norm = minmax(np.array([idf for _, _, idf, _ in raw]))
 
-        # Step 4: blend quality and rarity
         scored: List[Keyword] = []
 
         for i, (kw, _, _, pos) in enumerate(raw):
@@ -342,17 +294,18 @@ class ZhKeywordExtractor:
 
     @staticmethod
     def load_keywords(filepath: Union[str, Path]) -> List[List[Keyword]]:
-        """Load chunk-level keyword lists from JSON."""
         filepath = Path(filepath)
+
         with filepath.open("r", encoding="utf-8") as f:
             data = json.load(f)
+
         return [[(kw, score, pos) for kw, score, pos in chunk] for chunk in data]
 
     @staticmethod
     def save_keywords(keywords: List[List[Keyword]], filepath: Union[str, Path]) -> None:
-        """Save chunk-level keyword lists to JSON."""
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
+
         with filepath.open("w", encoding="utf-8") as f:
             json.dump(keywords, f, ensure_ascii=False, indent=2)
 
@@ -362,19 +315,13 @@ class ZhKeywordExtractor:
 
     @staticmethod
     def clean_han_light(text: str) -> str:
-        """
-        Light cleaning for classical Han text while preserving newlines.
-            - NFC normalize
-            - remove zero-width characters
-            - strip in-line spaces/tabs
-            - keep line boundaries (so headings don't merge into body)
-        """
         text = text or ""
         text = unicodedata.normalize("NFC", text)
         text = re.sub(r"[​‌‍﻿]", "", text)
         text = text.replace("\r\n", "\n").replace("\r", "\n")
 
         lines: List[str] = []
+
         for line in text.split("\n"):
             line = re.sub(r"[ \t]+", "", line).strip()
             if line:
@@ -384,15 +331,6 @@ class ZhKeywordExtractor:
 
     @staticmethod
     def split_chunk_to_clauses(chunk: str) -> List[str]:
-        """
-        Split a chunk into clean clauses (no punctuation inside each clause).
-
-        Splits on Chinese sentence/clause punctuation and book brackets, then
-        strips any leftover outer punctuation, and drops empty fragments.
-
-        Returns:
-            A list of clean text fragments, each with no punctuation inside.
-        """
         if not chunk:
             return []
 
@@ -400,6 +338,7 @@ class ZhKeywordExtractor:
         raw_parts = re.split(pattern, chunk)
 
         clauses: List[str] = []
+
         for part in raw_parts:
             cleaned = part.strip().strip(ZhKeywordExtractor.CLAUSE_SPLIT_PUNCT + " \t\r")
             if cleaned:
@@ -413,22 +352,16 @@ class ZhKeywordExtractor:
 
     @staticmethod
     def parse_conllu(conllu_text: str) -> List[Tok]:
-        """
-        Parse a CoNLL-U formatted string into a list of Tok objects.
-
-        Skips:
-            - empty lines and comments
-            - multi-word tokens (id contains '-')
-            - empty nodes (id contains '.')
-        """
         tokens: List[Tok] = []
 
         for line in conllu_text.splitlines():
             line = line.strip()
+
             if not line or line.startswith("#"):
                 continue
 
             parts = line.split("\t")
+
             if len(parts) < 8:
                 continue
 
@@ -437,9 +370,14 @@ class ZhKeywordExtractor:
 
             try:
                 tid = int(parts[0])
-                head = int(parts[6])
             except ValueError:
                 continue
+
+            # CoNLL-U HEAD may be "_" for tokens with unspecified head (e.g.
+            # orphans in some pipeline outputs).  Treat "_" as 0 (root) so the
+            # token is kept rather than silently dropped.
+            head_str = parts[6]
+            head = int(head_str) if head_str != "_" else 0
 
             tokens.append(
                 Tok(
@@ -458,246 +396,33 @@ class ZhKeywordExtractor:
         return tokens
 
     @staticmethod
-    def build_children(tokens: List[Tok]) -> Dict[int, List[Tok]]:
-        """Group tokens by their head id, so we can walk the dependency tree."""
-        children: Dict[int, List[Tok]] = {}
-        for t in tokens:
-            children.setdefault(t.head, []).append(t)
-        return children
-
-    @staticmethod
-    def is_contiguous(ids: List[int]) -> bool:
-        """Check if a list of token ids forms a contiguous range."""
-        ids = sorted(ids)
-        if not ids:
-            return False
-        return ids == list(range(ids[0], ids[-1] + 1))
-
-    @staticmethod
-    def make_span(
-        tokens: List[Tok],
-        ids: List[int],
-        rule: str,
-        head_id: Optional[int] = None,
-        upos: Optional[str] = None,
-    ) -> Optional[MergeSpan]:
-        """
-        Construct a MergeSpan from a list of token ids if valid:
-            - at least 2 tokens
-            - contiguous
-            - merged text length in [2, 12] characters
-        """
-        ids = sorted(set(ids))
-
-        if len(ids) < 2:
-            return None
-        if not ZhKeywordExtractor.is_contiguous(ids):
-            return None
-
-        id_to_tok = {t.id: t for t in tokens}
-        if any(i not in id_to_tok for i in ids):
-            return None
-
-        text = "".join(id_to_tok[i].form for i in ids)
-        if not (2 <= len(text) <= 12):
-            return None
-
-        if head_id is None:
-            head_id = ids[-1]
-
-        head_tok = id_to_tok.get(head_id, id_to_tok[ids[-1]])
-        span_upos = upos if upos is not None else head_tok.upos
-
-        return MergeSpan(
-            start_id=ids[0],
-            end_id=ids[-1],
-            text=text,
-            rule=rule,
-            upos=span_upos,
-            head_id=head_tok.id,
-            head_form=head_tok.form,
-        )
-
-    # =========================================================================
-    # STATIC HELPERS — SPAN EXTRACTION RULES
-    # =========================================================================
-
-    @staticmethod
-    def get_goeswith_flat_spans(tokens: List[Tok]) -> List[MergeSpan]:
-        """
-        Merge tokens connected via 'goeswith' or 'flat' deprels.
-        Useful for multi-character proper nouns and book titles.
-        """
-        children = ZhKeywordExtractor.build_children(tokens)
-        spans: List[MergeSpan] = []
-
-        for head in tokens:
-            ids = [head.id]
-            for c in children.get(head.id, []):
-                if c.deprel in {"goeswith", "flat"}:
-                    ids.append(c.id)
-
-            span = ZhKeywordExtractor.make_span(
-                tokens, ids, rule="goeswith_flat", head_id=head.id, upos=head.upos,
-            )
-            if span:
-                spans.append(span)
-
-        return spans
-
-    @staticmethod
-    def get_conj_pair_spans(tokens: List[Tok]) -> List[MergeSpan]:
-        """
-        Merge adjacent noun-conj-noun pairs (e.g., "天地", "君臣").
-        Only applies when the conj child immediately follows the head.
-        """
-        spans: List[MergeSpan] = []
-        id_to_tok = {t.id: t for t in tokens}
-
-        for t in tokens:
-            head = id_to_tok.get(t.head)
-            if not head:
-                continue
-
-            if (
-                t.deprel == "conj"
-                and t.id == head.id + 1
-                and t.upos in {"NOUN", "PROPN", "X"}
-                and head.upos in {"NOUN", "PROPN", "X"}
-            ):
-                span = ZhKeywordExtractor.make_span(
-                    tokens, [head.id, t.id], rule="conj_pair", head_id=head.id, upos=head.upos,
-                )
-                if span:
-                    spans.append(span)
-
-        return spans
-
-    @staticmethod
-    def get_local_modifier_head_spans(tokens: List[Tok]) -> List[MergeSpan]:
-        """
-        Merge a local modifier (amod / nmod / compound / flat / goeswith)
-        with its head NOUN/PROPN when they are directly adjacent.
-        """
-        children = ZhKeywordExtractor.build_children(tokens)
-        spans: List[MergeSpan] = []
-
-        allowed_local_deprels = {"amod", "nmod", "compound", "flat", "goeswith"}
-
-        for head in tokens:
-            if head.upos not in {"NOUN", "PROPN"}:
-                continue
-
-            for child in children.get(head.id, []):
-                if child.id == head.id - 1 and child.deprel in allowed_local_deprels:
-                    span = ZhKeywordExtractor.make_span(
-                        tokens,
-                        [child.id, head.id],
-                        rule="local_modifier_head",
-                        head_id=head.id,
-                        upos=head.upos,
-                    )
-                    if span:
-                        spans.append(span)
-
-        return spans
-
-    # =========================================================================
-    # STATIC HELPERS — SPAN SELECTION + APPLICATION
-    # =========================================================================
-
-    @staticmethod
-    def select_non_overlapping_spans(spans: List[MergeSpan]) -> List[MergeSpan]:
-        """Pick a non-overlapping subset of spans, preferring high-priority rules."""
-        rule_priority = {
-            "num_clf_head": 0,
-            "local_modifier_head": 1,
-            "goeswith_flat": 2,
-            "conj_pair": 3,
-            "dep_left_np": 4,
-            "adjacent_nominal": 5,
-        }
-
-        spans = sorted(
-            spans,
-            key=lambda s: (
-                rule_priority.get(s.rule, 99),
-                s.start_id,
-                -(s.end_id - s.start_id + 1),
-            ),
-        )
-
-        selected: List[MergeSpan] = []
-        occupied: set = set()
-
-        for s in spans:
-            ids = set(range(s.start_id, s.end_id + 1))
-            if ids & occupied:
-                continue
-            selected.append(s)
-            occupied |= ids
-
-        return sorted(selected, key=lambda s: s.start_id)
-
-    @staticmethod
-    def apply_spans_to_token_records(
-        tokens: List[Tok], spans: List[MergeSpan]
-    ) -> List[TokenRecord]:
-        """
-        Apply merge spans to the original token list.
-
-        Returns a list of token records, where each record is either:
-            - a merged span (multi-character word), or
-            - a single original token (form + upos preserved).
-        """
-        span_by_start = {s.start_id: s for s in spans}
-        covered: set = set()
-        output: List[TokenRecord] = []
-
-        for t in tokens:
-            if t.id in covered:
-                continue
-
-            span = span_by_start.get(t.id)
-            if span:
-                output.append({
-                    "form": span.text,
-                    "upos": span.upos,
-                    "start_id": span.start_id,
-                    "end_id": span.end_id,
-                    "rule": span.rule,
-                    "head_id": span.head_id,
-                    "head_form": span.head_form,
-                })
-                covered.update(range(span.start_id, span.end_id + 1))
-            else:
-                output.append({
-                    "form": t.form,
-                    "upos": t.upos,
-                    "start_id": t.id,
-                    "end_id": t.id,
-                    "rule": "original",
-                    "head_id": t.id,
-                    "head_form": t.form,
-                })
-
-        return output
-
-    @staticmethod
     def segment_from_conllu(conllu_text: str) -> List[TokenRecord]:
         """
-        Parse a CoNLL-U string and apply translation-mode merge rules.
-        Returns a list of token records with merged spans applied.
+        Convert CoNLL-U output directly into token records.
+
+        No custom span merging is applied. We trust the pipeline's own
+        post-processing/segmentation.
         """
         tokens = ZhKeywordExtractor.parse_conllu(conllu_text)
 
-        spans: List[MergeSpan] = []
-        spans.extend(ZhKeywordExtractor.get_local_modifier_head_spans(tokens))
-        spans.extend(ZhKeywordExtractor.get_goeswith_flat_spans(tokens))
-        spans.extend(ZhKeywordExtractor.get_conj_pair_spans(tokens))
+        records: List[TokenRecord] = []
 
-        selected = ZhKeywordExtractor.select_non_overlapping_spans(spans)
-        return ZhKeywordExtractor.apply_spans_to_token_records(tokens, selected)
+        for t in tokens:
+            records.append({
+                "form": t.form,
+                "lemma": t.lemma,
+                "upos": t.upos,
+                "xpos": t.xpos,
+                "feats": t.feats,
+                "head": t.head,
+                "deprel": t.deprel,
+                "misc": t.misc,
+                "start_id": t.id,
+                "end_id": t.id,
+                "rule": "pipeline",
+            })
+
+        return records
 
     # =========================================================================
     # PRIVATE — CORE CHUNK PROCESSING
@@ -711,20 +436,13 @@ class ZhKeywordExtractor:
         diversity: float,
         use_mmr: bool,
     ) -> List[Keyword]:
-        """
-        Process one chunk end-to-end:
-            1. Clause splitting
-            2. UD parse each clause -> CoNLL-U
-            3. Span merging -> per-clause token records
-            4. Candidate n-gram generation (within each clause only)
-            5. Embedding + ranking against the whole chunk
-            6. Deduplication
-        """
         clause_records = self._annotate_chunk(chunk)
+
         if not clause_records:
             return []
 
         candidates = self._extract_candidates(clause_records, ngram_range)
+
         if not candidates:
             return []
 
@@ -753,52 +471,123 @@ class ZhKeywordExtractor:
         return self._deduplicate(results)
 
     # =========================================================================
-    # PRIVATE — UD PARSING (CLAUSE-LEVEL)
+    # PRIVATE — UD PIPELINE PARSING
     # =========================================================================
 
     def _annotate_chunk(self, chunk: str) -> List[List[TokenRecord]]:
         """
-        Run UD parsing clause-by-clause and return per-clause token records.
+        Tokenize + POS-tag every clause in a chunk via the goeswith UD pipeline,
+        batching masked forward passes across clauses to amortise GPU overhead.
 
-        Why clause-level:
-            - UD parsers are most accurate on sentence-sized input.
-            - Keeps n-gram extraction from spanning clause boundaries later.
-
-        Returns:
-            A list of clause records, where each clause record is a list of
-            token records (either single tokens or merged multi-char spans).
+        Background: the goeswith pipeline cannot accept a list of sentences because
+        it builds an (n×n) internal batch per sentence (one row per masked token),
+        consuming the batch axis internally. We reproduce that masking manually,
+        pack rows from multiple clauses into one padded tensor, run one forward pass
+        per row-capped sub-batch (``nlp_batch_size``), slice each clause's (n×n)
+        logit block back out, then delegate to ``nlp.postprocess`` for MST decoding
+        and goeswith word merge — output is identical to calling nlp(clause) in a
+        loop, just faster. The tokenizer is called directly (not ``nlp.preprocess``)
+        because preprocess became a generator in HF transformers ≥4.43.
         """
+        import torch
+
         clauses = self.split_chunk_to_clauses(chunk)
+        clauses = [c.strip() for c in clauses if c and c.strip()]
         if not clauses:
             return []
 
-        out: List[List[TokenRecord]] = []
-        original_cwd = os.getcwd()
+        tok = self.nlp.tokenizer
+        mask_id = tok.mask_token_id
+        pad_id = tok.pad_token_id or 0
+        device = self.nlp.model.device
+        is_fast = getattr(tok, "is_fast", False)
 
-        try:
-            for clause in clauses:
-                if not clause.strip():
-                    continue
+        # ── Phase 1: tokenize each clause, build masked rows ─────────────────
+        prepared: List[Dict[str, Any]] = []
+        for clause in clauses:
+            try:
+                enc = tok(clause, return_offsets_mapping=is_fast, return_tensors="pt")
+            except Exception as e:
+                print(f"⚠️ UD tokenize error: {e}")
+                continue
 
+            v = enc["input_ids"][0].tolist()  # [CLS, t1…tn, SEP]
+            if len(v) < 3:
+                continue
+
+            if is_fast:
+                offset_mapping = enc["offset_mapping"]  # (1, L, 2)
+            else:
+                # char-level fallback: one token = one source character
+                n = len(v) - 2
+                offset_mapping = torch.tensor([[[0, 0]] + [[i, i+1] for i in range(n)] + [[0, 0]]])
+
+            # goeswith masking trick: row i = mask position i, append v[i] at end
+            rows = [v[:i] + [mask_id] + v[i+1:] + [v[i]] for i in range(1, len(v)-1)]
+            prepared.append({"rows": rows, "n": len(rows),
+                              "offset_mapping": offset_mapping,
+                              "sentence": clause, "logits": None})
+
+        if not prepared:
+            return []
+
+        # ── Phase 2: batched GPU forward ─────────────────────────────────────
+        row_cap = max(1, int(self.nlp_batch_size))
+
+        def run_group(group: List[Dict[str, Any]]) -> None:
+            flat = [r for pc in group for r in pc["rows"]]
+            width = max(len(r) for r in flat)
+            ids = [r + [pad_id] * (width - len(r)) for r in flat]
+            attn = [[1] * len(r) + [0] * (width - len(r)) for r in flat]
+            with torch.no_grad():
+                logits = self.nlp.model(
+                    input_ids=torch.tensor(ids, device=device),
+                    attention_mask=torch.tensor(attn, device=device),
+                ).logits
+            cur = 0
+            for pc in group:
+                n = pc["n"]
+                # slice [CLS] off front and [SEP]+appended+padding off back
+                pc["logits"] = logits[cur:cur+n, 1:1+n, :].detach().to("cpu")
+                cur += n
+
+        group: List[Dict[str, Any]] = []
+        group_rows = 0
+        for pc in prepared:
+            if group and group_rows + pc["n"] > row_cap:
                 try:
-                    conllu = self.nlp(clause)
+                    run_group(group)
                 except Exception as e:
-                    print(f"⚠️ UD parse error on clause: {e}")
-                    continue
+                    print(f"⚠️ UD forward error: {e}")
+                group, group_rows = [], 0
+            group.append(pc)
+            group_rows += pc["n"]
+        if group:
+            try:
+                run_group(group)
+            except Exception as e:
+                print(f"⚠️ UD forward error: {e}")
 
-                # Some custom UD pipelines may return non-string objects;
-                # fall back to str() to stay robust.
-                if not isinstance(conllu, str):
-                    conllu = str(conllu)
-
-                if not conllu.strip():
-                    continue
-
-                records = self.segment_from_conllu(conllu)
-                if records:
-                    out.append(records)
-        finally:
-            os.chdir(original_cwd)
+        # ── Phase 3: decode CoNLL-U via pipeline's own postprocess ────────────
+        out: List[List[TokenRecord]] = []
+        for pc in prepared:
+            if pc["logits"] is None:
+                continue
+            try:
+                conllu = self.nlp.postprocess(
+                    {"logits": pc["logits"],
+                     "offset_mapping": pc["offset_mapping"],
+                     "sentence": pc["sentence"]},
+                    aggregation_strategy="simple",
+                )
+            except Exception as e:
+                print(f"⚠️ UD decode error: {e}")
+                continue
+            if not isinstance(conllu, str) or not conllu.strip():
+                continue
+            records = self.segment_from_conllu(conllu)
+            if records:
+                out.append(records)
 
         return out
 
@@ -811,13 +600,6 @@ class ZhKeywordExtractor:
         clause_records: List[List[TokenRecord]],
         ngram_range: Tuple[int, int],
     ) -> List[str]:
-        """
-        Generate valid n-gram candidates from per-clause POS-tagged records.
-
-        N-grams are extracted WITHIN each clause only — they never span
-        clause boundaries. Chinese has no word boundary, so we join n-grams
-        with the empty string.
-        """
         candidates: set = set()
 
         for records in clause_records:
@@ -831,27 +613,19 @@ class ZhKeywordExtractor:
 
                     if self._is_valid_candidate(ngram_forms, ngram_pos):
                         candidate = "".join(ngram_forms)
+
                         if len(candidate) >= 2:
                             candidates.add(candidate)
 
         return list(candidates)
 
     def _is_valid_candidate(self, forms: List[str], pos_tags: List[str]) -> bool:
-        """
-        Validate an n-gram candidate using POS and lexical constraints.
-
-        Strategy:
-            - boundary tokens must have a kept POS tag
-            - no forbidden POS tags (PUNCT / X / SYM) anywhere in the n-gram
-            - unigram: discarded if it is a stopword
-            - n-gram >= 2: discarded only if first or last token is a stopword
-            - reject candidates containing digits or empty forms
-        """
         if not forms or not pos_tags:
             return False
 
         if pos_tags[0] not in self.keep_pos_tags:
             return False
+
         if pos_tags[-1] not in self.keep_pos_tags:
             return False
 
@@ -880,13 +654,6 @@ class ZhKeywordExtractor:
         clause_records: List[List[TokenRecord]],
         ngram_range: Tuple[int, int],
     ) -> Dict[str, str]:
-        """
-        Build a mapping from candidate text -> POS pattern (space-separated).
-
-        Example:
-            "紅樓夢"   -> "PROPN"
-            "天地之間" -> "NOUN NOUN ADP NOUN"
-        """
         pos_map: Dict[str, str] = {}
 
         for records in clause_records:
@@ -896,6 +663,7 @@ class ZhKeywordExtractor:
             for n in range(ngram_range[0], ngram_range[1] + 1):
                 for i in range(len(forms) - n + 1):
                     ngram = "".join(forms[i : i + n])
+
                     if ngram not in pos_map:
                         pos_map[ngram] = " ".join(pos_tags[i : i + n])
 
@@ -912,7 +680,6 @@ class ZhKeywordExtractor:
         candidates: List[str],
         top_n: int,
     ) -> List[Tuple[str, float]]:
-        """Rank candidates by cosine similarity against the chunk embedding."""
         similarities = cosine_similarity(
             candidate_embeddings,
             doc_embedding.reshape(1, -1),
@@ -923,6 +690,7 @@ class ZhKeywordExtractor:
             key=lambda x: x[1],
             reverse=True,
         )
+
         return [(kw, float(score)) for kw, score in ranked[:top_n]]
 
     def _rank_mmr(
@@ -933,13 +701,6 @@ class ZhKeywordExtractor:
         top_n: int,
         diversity: float,
     ) -> List[Tuple[str, float]]:
-        """
-        Rank candidates with Maximal Marginal Relevance (MMR).
-
-        Balances relevance to the document vs diversity among selected keywords.
-            - low diversity  -> favor relevance
-            - high diversity -> favor variety
-        """
         if not candidates:
             return []
 
@@ -963,6 +724,7 @@ class ZhKeywordExtractor:
 
         while len(selected) < top_n and remaining:
             mmr_scores = []
+
             for idx in remaining:
                 relevance = doc_sim[idx]
                 redundancy = max(cand_sim[idx][selected])
@@ -984,10 +746,11 @@ class ZhKeywordExtractor:
     # =========================================================================
 
     def _split_text(self, text: str) -> List[str]:
-        """Split a long text into overlapping chunks."""
         text = str(text).strip()
+
         if not text:
             return []
+
         if len(text) <= self.chunk_size:
             return [text]
 
@@ -995,7 +758,6 @@ class ZhKeywordExtractor:
         return [c.strip() for c in chunks if c and c.strip()]
 
     def _encode_text(self, text: str) -> np.ndarray:
-        """Encode a single text into a normalized embedding."""
         return self.sbert.encode(
             text,
             normalize_embeddings=True,
@@ -1003,21 +765,20 @@ class ZhKeywordExtractor:
         )
 
     def _encode_texts(self, texts: List[str]) -> np.ndarray:
-        """Encode a list of texts into normalized embeddings."""
         return self.sbert.encode(
             texts,
-            batch_size=32,
+            batch_size=self.sbert_batch_size,
             normalize_embeddings=True,
             convert_to_numpy=True,
             show_progress_bar=False,
         )
 
     def _deduplicate(self, keywords: List[Keyword]) -> List[Keyword]:
-        """Deduplicate keywords by normalized form, keeping the highest score."""
         seen: Dict[str, Keyword] = {}
 
         for kw, score, pos in keywords:
             key = normalize_chinese_phrase(kw)
+
             if key not in seen or score > seen[key][1]:
                 seen[key] = (kw, score, pos)
 
@@ -1025,154 +786,24 @@ class ZhKeywordExtractor:
 
 
 # =============================================================================
-# CLI ENTRY POINT
+# IN-PROCESS ENTRY POINT (mirrors VnKeywordExtractor.run_keyword_extraction)
 # =============================================================================
-
-def main():
-    parser = argparse.ArgumentParser(description="Classical Chinese keyword extraction")
-
-    # input
-    parser.add_argument("--input_path", type=str, default=None, help="Path to one input .txt file")
-    parser.add_argument("--input_dir", type=str, default=None, help="Path to a directory containing .txt files")
-    parser.add_argument("--output_dir", type=str, default="./keyword", help="Directory to save keyword JSON")
-
-    # models
-    parser.add_argument(
-        "--nlp_model_name",
-        type=str,
-        default="KoichiYasuoka/roberta-classical-chinese-base-ud-goeswith",
-        help="UD parser model name or local path",
-    )
-    parser.add_argument(
-        "--sbert_model_name",
-        type=str,
-        default="BAAI/bge-base-zh-v1.5",
-        help="SentenceTransformer model name or local path",
-    )
-
-    # stopwords
-    parser.add_argument("--stopwords_path", type=str, default=None, help="Local stopwords file")
-
-    # hyperparameters
-    parser.add_argument("--top_n", type=int, default=15)
-    parser.add_argument("--min_n", type=int, default=1)
-    parser.add_argument("--max_n", type=int, default=1)
-    parser.add_argument("--diversity", type=float, default=0.4)
-    parser.add_argument("--chunk_size", type=int, default=400)
-    parser.add_argument("--chunk_overlap", type=int, default=50)
-
-    parser.add_argument("--recursive", action="store_true", help="Recursively search .txt files in input_dir")
-    parser.add_argument("--verbose", action="store_true")
-
-    args = parser.parse_args()
-
-    if bool(args.input_path) == bool(args.input_dir):
-        raise ValueError("Provide exactly one of --input_path or --input_dir")
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # load stopwords
-    stopwords: set = set()
-    if args.stopwords_path:
-        stopwords_path = Path(args.stopwords_path)
-        if stopwords_path.exists():
-            with stopwords_path.open("r", encoding="utf-8") as f:
-                stopwords = {
-                    normalize_chinese_phrase(line.strip())
-                    for line in f
-                    if line.strip()
-                }
-
-    # load models
-    nlp_pipeline = hf_pipeline(
-        "universal-dependencies",
-        args.nlp_model_name,
-        trust_remote_code=True,
-        aggregation_strategy="simple",
-        device=0 if cuda_available() else -1,
-    )
-
-    sbert = SentenceTransformer(args.sbert_model_name)
-
-    extractor = ZhKeywordExtractor(
-        nlp_pipeline=nlp_pipeline,
-        sbert=sbert,
-        stopwords=stopwords,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap,
-    )
-
-    # collect input files
-    if args.input_path:
-        input_files = [Path(args.input_path)]
-    else:
-        input_dir = Path(args.input_dir)
-        if args.recursive:
-            input_files = sorted(input_dir.rglob("*.txt"))
-        else:
-            input_files = sorted(input_dir.glob("*.txt"))
-
-    if not input_files:
-        raise FileNotFoundError("No .txt files found")
-
-    if args.verbose:
-        print(f"Found {len(input_files)} input file(s)")
-
-    # process each file
-    for input_path in input_files:
-        doc_id = input_path.stem
-
-        with input_path.open("r", encoding="utf-8") as f:
-            text = f.read().strip()
-
-        cleaned = ZhKeywordExtractor.clean_han_light(text)
-
-        chunk_kws = extractor.extract(
-            cleaned,
-            top_n=args.top_n,
-            ngram_range=(args.min_n, args.max_n),
-            diversity=args.diversity,
-            verbose=args.verbose,
-            aggregate=False,
-            return_chunks=False,
-        )
-
-        data = {
-            "doc_id": doc_id,
-            "chunks": [],
-        }
-
-        for idx, kw_list in enumerate(chunk_kws):
-            data["chunks"].append({
-                "chunk_id": idx,
-                "keywords": [
-                    {"word": kw, "score": score, "pos": pos}
-                    for kw, score, pos in kw_list
-                ],
-            })
-
-        filepath = output_dir / f"{doc_id}.json"
-        with filepath.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-        if args.verbose:
-            print(f"Saved to: {filepath}")
-
 
 def run_keyword_extraction(
     extractor: "ZhKeywordExtractor",
     input_files: List[Path],
     output_dir: Path,
     top_n: int = 15,
-    min_n: int = 1,
-    max_n: int = 1,
+    ngram_range: Tuple[int, int] = (1, 1),
     diversity: float = 0.4,
     verbose: bool = False,
 ) -> None:
     """
     In-process entry point — model passed in pre-loaded.
     Designed to be called from Streamlit using @st.cache_resource models.
+
+    Matches the public interface of VnKeywordExtractor.run_keyword_extraction
+    so both extractors can be driven by the same pipeline code in app.py.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1190,15 +821,15 @@ def run_keyword_extraction(
 
         chunk_kws = extractor.extract(
             cleaned,
-            top_n=top_n,
-            ngram_range=(min_n, max_n),
+            top_n=top_n * 2,
+            ngram_range=ngram_range,
             diversity=diversity,
             verbose=verbose,
             aggregate=False,
             return_chunks=False,
         )
 
-        data = {
+        data: Dict[str, Any] = {
             "doc_id": doc_id,
             "chunks": [],
         }
@@ -1218,6 +849,140 @@ def run_keyword_extraction(
 
         if verbose:
             print(f"Saved to: {filepath}")
+
+
+# =============================================================================
+# CLI ENTRY POINT
+# =============================================================================
+
+def main() -> None:
+    # Heavy deps imported locally so the module stays lightweight when used
+    # in-process (e.g. Streamlit @st.cache_resource).
+    import argparse
+    from transformers import pipeline as hf_pipeline
+    from sentence_transformers import SentenceTransformer
+    from lib.utils import cuda_available
+
+    parser = argparse.ArgumentParser(
+        description="Classical Chinese keyword extraction (UD pipeline + SBERT)"
+    )
+
+    # I/O
+    parser.add_argument("--input_path", type=str, default=None,
+                        help="Path to one .txt file")
+    parser.add_argument("--input_dir", type=str, default=None,
+                        help="Directory containing .txt files")
+    parser.add_argument("--output_dir", type=str, default="./zh_keyword",
+                        help="Directory to save keyword JSON output")
+    parser.add_argument("--recursive", action="store_true",
+                        help="Recursively search .txt files under --input_dir")
+
+    # Models
+    parser.add_argument(
+        "--ud_model_name",
+        type=str,
+        default="KoichiYasuoka/roberta-classical-chinese-base-ud-goeswith",
+        help="HuggingFace model for Universal Dependencies parsing (returns CoNLL-U)",
+    )
+    parser.add_argument(
+        "--sbert_model_name",
+        type=str,
+        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        help="SentenceTransformer model for candidate ranking",
+    )
+
+    # Stopwords
+    parser.add_argument("--stopwords_path", type=str, default=None,
+                        help="Path to a plain-text stopword list (one term per line)")
+
+    # Extraction hyperparams
+    parser.add_argument("--top_n", type=int, default=15,
+                        help="Top N keywords to keep per document")
+    parser.add_argument("--min_n", type=int, default=1,
+                        help="Minimum n-gram size")
+    parser.add_argument("--max_n", type=int, default=1,
+                        help="Maximum n-gram size")
+    parser.add_argument("--diversity", type=float, default=0.4,
+                        help="MMR diversity parameter")
+    parser.add_argument("--chunk_size", type=int, default=1500,
+                        help="Max characters per text chunk")
+    parser.add_argument("--chunk_overlap", type=int, default=50,
+                        help="Character overlap between adjacent chunks")
+    parser.add_argument("--sbert_batch_size", type=int, default=32,
+                        help="Batch size for SBERT embedding")
+    parser.add_argument("--nlp_batch_size", type=int, default=128,
+                        help="Max masked rows per UD forward pass (GPU memory bound)")
+
+    parser.add_argument("--verbose", action="store_true")
+
+    args = parser.parse_args()
+
+    if bool(args.input_path) == bool(args.input_dir):
+        raise ValueError("Provide exactly one of --input_path or --input_dir")
+
+    # Collect input files
+    if args.input_path:
+        input_files = [Path(args.input_path)]
+    else:
+        input_dir = Path(args.input_dir)
+        pattern = "**/*.txt" if args.recursive else "*.txt"
+        input_files = sorted(input_dir.glob(pattern))
+        if not input_files:
+            raise FileNotFoundError(f"No .txt files found in {input_dir}")
+
+    # Load stopwords
+    stopwords: set = set()
+    if args.stopwords_path:
+        sw_path = Path(args.stopwords_path)
+        if sw_path.exists():
+            with sw_path.open("r", encoding="utf-8") as f:
+                stopwords = {
+                    normalize_chinese_phrase(line.strip())
+                    for line in f
+                    if line.strip()
+                }
+
+    if args.verbose:
+        print(f"Found {len(input_files)} input file(s)")
+        print(f"Loading UD model: {args.ud_model_name}")
+
+    # Load models
+    device = 0 if cuda_available() else -1
+    nlp_pipeline = hf_pipeline(
+        "universal-dependencies",
+        model=args.ud_model_name,
+        trust_remote_code=True,
+        aggregation_strategy="simple",
+        device=device,
+    )
+
+    if args.verbose:
+        print(f"Loading SBERT model: {args.sbert_model_name}")
+
+    sbert = SentenceTransformer(
+        args.sbert_model_name,
+        device="cuda" if cuda_available() else "cpu",
+    )
+
+    extractor = ZhKeywordExtractor(
+        nlp_pipeline=nlp_pipeline,
+        sbert=sbert,
+        stopwords=stopwords,
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.chunk_overlap,
+        sbert_batch_size=args.sbert_batch_size,
+        nlp_batch_size=args.nlp_batch_size,
+    )
+
+    run_keyword_extraction(
+        extractor=extractor,
+        input_files=input_files,
+        output_dir=Path(args.output_dir),
+        top_n=args.top_n,
+        ngram_range=(args.min_n, args.max_n),
+        diversity=args.diversity,
+        verbose=args.verbose,
+    )
 
 
 if __name__ == "__main__":

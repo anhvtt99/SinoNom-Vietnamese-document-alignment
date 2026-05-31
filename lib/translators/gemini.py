@@ -58,15 +58,54 @@ Chỉ trả về đúng một JSON object dạng:
 """.strip()
 
 
-def translate_vi_to_han_with_gemini(
+def build_han_to_vi_prompt(terms: List[str]) -> str:
+    return f"""
+Bạn là một học giả chuyên về Lịch sử Việt Nam trung đại và văn tự Hán cổ.
+
+Nhiệm vụ:
+Chuyển các từ/cụm từ Hán tự (Phồn Thể / Hán văn lịch sử) sang Chữ Quốc Ngữ tương ứng,
+ưu tiên cách đọc/cách ghi đã dùng trong sử Việt Nam.
+
+YÊU CẦU BẮT BUỘC:
+1. Với tên riêng lịch sử Việt Nam, dùng đúng tên Quốc Ngữ đã quen dùng trong sử Việt,
+   KHÔNG phiên âm theo âm Hán hiện đại của Trung Quốc.
+   Ví dụ: "涇陽王" -> "Kinh Dương Vương" (không phải "Kính Dương Vương" kiểu khác).
+2. Trả về dạng có dấu, viết hoa đúng chuẩn tên riêng, dùng dấu cách giữa các âm tiết
+   (KHÔNG dùng dấu gạch dưới "_").
+3. Nếu là danh từ chung, trả về nghĩa tiếng Việt thông dụng nhất.
+4. Không giải thích, không chú thích, không thêm văn bản ngoài JSON.
+5. Nếu không chắc chắn hoặc không xác định được, trả về chuỗi rỗng "" cho mục đó.
+6. Không được bịa ra đáp án.
+
+VÍ DỤ CHUẨN:
+
+Input: ["涇陽王", "嫗姬", "交阯", "秦", "大越"]
+Output: {{"涇陽王": "Kinh Dương Vương", "嫗姬": "Âu Cơ", "交阯": "Giao Chỉ", "秦": "nhà Tần", "大越": "Đại Việt"}}
+
+Input: ["山精", "任囂", "趙佗", "湟谿"]
+Output: {{"山精": "Sơn Tinh", "任囂": "Nhâm Ngao", "趙佗": "Triệu Đà", "湟谿": "Hoàng Khê"}}
+
+BÂY GIỜ HÃY DỊCH DANH SÁCH SAU:
+
+Input: {json.dumps(terms, ensure_ascii=False)}
+
+Chỉ trả về đúng một JSON object dạng:
+{{
+  "Từ_Hán": "Từ Quốc Ngữ"
+}}
+""".strip()
+
+
+def _translate_with_gemini(
     model,
     terms: List[str],
+    prompt_builder,
     verbose: bool = False,
 ) -> Dict[str, str]:
     """
-    Translate Vietnamese Quốc Ngữ terms to historical Han / Traditional Chinese.
+    Generic single-direction Gemini translation.
 
-    Signature compatible with BatchTranslator after binding model:
+    Signature compatible with BatchTranslator after binding model + prompt:
         List[str] -> Dict[str, str]
     """
     if not terms:
@@ -85,7 +124,7 @@ def translate_vi_to_han_with_gemini(
     if not clean_terms:
         return {}
 
-    prompt = build_vi_to_han_prompt(clean_terms)
+    prompt = prompt_builder(clean_terms)
 
     try:
         response = model.generate_content(
@@ -123,6 +162,13 @@ def translate_vi_to_han_with_gemini(
         return {}
 
 
+# Prompt builder per translation direction.
+_PROMPT_BUILDERS = {
+    ("vi", "zh"): build_vi_to_han_prompt,
+    ("zh", "vi"): build_han_to_vi_prompt,
+}
+
+
 def create_gemini_translate_fn(
     api_key: str,
     model_name: str = "models/gemini-2.5-pro",
@@ -133,10 +179,13 @@ def create_gemini_translate_fn(
     """
     Create a translate_fn compatible with BatchTranslator.
 
+    Supported directions: vi->zh and zh->vi.
+
     Returns:
         Callable[[List[str]], Dict[str, str]]
     """
-    if not (src_lang == "vi" and tgt_lang == "zh"):
+    prompt_builder = _PROMPT_BUILDERS.get((src_lang, tgt_lang))
+    if prompt_builder is None:
         raise NotImplementedError(
             f"Gemini translation is not implemented for {src_lang}->{tgt_lang}"
         )
@@ -144,9 +193,10 @@ def create_gemini_translate_fn(
     model = create_gemini_model(api_key=api_key, model_name=model_name)
 
     def translate_fn(terms: List[str]) -> Dict[str, str]:
-        return translate_vi_to_han_with_gemini(
+        return _translate_with_gemini(
             model=model,
             terms=terms,
+            prompt_builder=prompt_builder,
             verbose=verbose,
         )
 

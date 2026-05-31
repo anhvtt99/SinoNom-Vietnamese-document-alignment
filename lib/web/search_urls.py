@@ -254,8 +254,30 @@ def search_one_query_file(
         "query_errors": query_errors,
     }
 
+    # By default, persist only what the next step (fetch_pages.py) reads:
+    # doc_id + query_results[].{query_id, query, rerank_source,
+    # requested_num_results, urls[]}, plus light traceability metadata.
+    # Use --full_output to keep search params, early-stop info, counters, errors.
+    if getattr(args, "full_output", False):
+        final_output = output
+    else:
+        final_output = {
+            "doc_id": doc_id,
+            "source_query_path": str(query_path),
+            "query_results": [
+                {
+                    "query_id": qr.get("query_id", ""),
+                    "query": qr.get("query", ""),
+                    "rerank_source": qr.get("rerank_source", ""),
+                    "requested_num_results": qr.get("requested_num_results"),
+                    "urls": qr.get("urls", []),
+                }
+                for qr in query_results
+            ],
+        }
+
     with output_path.open("w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+        json.dump(final_output, f, ensure_ascii=False, indent=2)
 
     if args.verbose:
         print(f"\nSaved URL file to: {output_path}")
@@ -354,6 +376,16 @@ def main():
         help=(
             "Stop searching a document when any normalized URL appears this many times "
             "across searched queries. If None, disabled."
+        ),
+    )
+
+    parser.add_argument(
+        "--full_output",
+        action="store_true",
+        help=(
+            "Persist all diagnostic fields (search params, early-stop info, "
+            "counters, per-query errors). Default keeps only fields the next "
+            "step needs."
         ),
     )
 

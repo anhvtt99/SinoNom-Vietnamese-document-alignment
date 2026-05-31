@@ -39,9 +39,20 @@ WIKISOURCE_CACHE_HIT_COUNT = 0
 WIKISOURCE_429_COUNT = 0
 
 
-def init_wikisource_session(verbose: bool = False, timeout: int = 10) -> bool:
+def init_wikisource_session(
+    verbose: bool = False,
+    timeout: int = 10,
+    api_url: Optional[str] = None,
+) -> bool:
     """
-    Initialize Wikisource HTTP session.
+    Initialize the MediaWiki HTTP session used for co-occurrence reranking.
+
+    Despite the historical "wikisource" naming, this is a generic MediaWiki
+    search client. The endpoint is chosen per translation direction:
+        - vi->zh : https://zh.wikisource.org/w/api.php (classical Han corpus)
+        - zh->vi : https://vi.wikipedia.org/w/api.php (rich modern VI corpus)
+
+    Endpoint precedence: api_url arg > WIKISOURCE_API env > default (zh.wikisource).
 
     Env variables loaded from shell or .env through lib.config:
         WIKISOURCE_API
@@ -60,7 +71,11 @@ def init_wikisource_session(verbose: bool = False, timeout: int = 10) -> bool:
 
     load_project_env()
 
-    WIKISOURCE_API = get_env("WIKISOURCE_API", DEFAULT_WIKISOURCE_API) or DEFAULT_WIKISOURCE_API
+    WIKISOURCE_API = (
+        api_url
+        or get_env("WIKISOURCE_API", DEFAULT_WIKISOURCE_API)
+        or DEFAULT_WIKISOURCE_API
+    )
     user_agent = get_env("WIKISOURCE_USER_AGENT", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT
 
     HEADERS["User-Agent"] = user_agent
