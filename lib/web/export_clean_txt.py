@@ -258,9 +258,19 @@ def sha1_text(text: str) -> str:
 
 
 def iter_json_files(input_dir: Path, recursive: bool = False) -> List[Path]:
+    # New fetch_pages layout puts per-doc index JSON under <page_dir>/docs/ and
+    # the content under <page_dir>/content/ (+ _registry.json). Prefer docs/ when
+    # present; fall back to the dir itself for the older flat layout.
+    docs_dir = input_dir / "docs"
+    base = docs_dir if docs_dir.is_dir() else input_dir
+
     if recursive:
-        return sorted(input_dir.rglob("*.json"))
-    return sorted(input_dir.glob("*.json"))
+        files = base.rglob("*.json")
+    else:
+        files = base.glob("*.json")
+
+    # Skip bookkeeping files (_registry.json, _summary.json, ...).
+    return sorted(p for p in files if not p.name.startswith("_"))
 
 
 # =============================================================================
@@ -782,9 +792,14 @@ def page_to_candidate(
     vertical_min_lines: int = 30,
     vertical_ratio_threshold: float = 0.60,
     vertical_avg_len_threshold: float = 3.0,
+    target_lang: str = "zh",
 ) -> Tuple[Optional[Candidate], Optional[Dict[str, Any]]]:
     """
     Convert a page record into a clean Candidate or a rejection reason.
+
+    target_lang controls which language the ratio/char filters and dedup
+    signature apply to: "zh" (Han characters, default) or "vi" (Latin/
+    Vietnamese characters, for zh→vi direction).
     """
     page_id = str(page.get("page_id") or "")
     if not page_id:
@@ -870,6 +885,21 @@ def page_to_candidate(
     text_len = len(text)
     han, latin, h_ratio, l_ratio = language_ratios(text)
 
+    # For zh→vi (target_lang="vi"), filter on Latin/Vietnamese chars;
+    # for vi→zh (target_lang="zh"), filter on Han chars (original behavior).
+    if target_lang == "vi":
+        filter_chars, filter_ratio = latin, l_ratio
+        filter_chars_field, filter_ratio_field = "latin_chars", "latin_ratio"
+        low_ratio_reason = "low_latin_ratio"
+        few_chars_reason = "too_few_latin_chars"
+        empty_sig_reason = "empty_latin_signature"
+    else:
+        filter_chars, filter_ratio = han, h_ratio
+        filter_chars_field, filter_ratio_field = "han_chars", "han_ratio"
+        low_ratio_reason = "low_han_ratio"
+        few_chars_reason = "too_few_han_chars"
+        empty_sig_reason = "empty_han_signature"
+
     if text_len < min_text_len:
         return None, {
             "page_id": page_id,
@@ -882,24 +912,26 @@ def page_to_candidate(
             "latin_ratio": l_ratio,
         }
 
-    if han < min_han_chars:
+    if filter_chars < min_han_chars:
         return None, {
             "page_id": page_id,
-            "reason": "too_few_han_chars",
+            "reason": few_chars_reason,
             "url": url,
             "text_len": text_len,
+            filter_chars_field: filter_chars,
             "han_chars": han,
             "latin_chars": latin,
             "han_ratio": h_ratio,
             "latin_ratio": l_ratio,
         }
 
-    if h_ratio < min_han_ratio:
+    if filter_ratio < min_han_ratio:
         return None, {
             "page_id": page_id,
-            "reason": "low_han_ratio",
+            "reason": low_ratio_reason,
             "url": url,
             "text_len": text_len,
+            filter_chars_field: filter_chars,
             "han_chars": han,
             "latin_chars": latin,
             "han_ratio": h_ratio,
@@ -908,7 +940,7 @@ def page_to_candidate(
 
     signature = extreme_clean_for_compare(
         text,
-        target_lang="zh",
+        target_lang=target_lang,
         opencc_converter=opencc_converter,
     )
     trad_score = traditional_score(text)
@@ -916,7 +948,7 @@ def page_to_candidate(
     if not signature:
         return None, {
             "page_id": page_id,
-            "reason": "empty_han_signature",
+            "reason": empty_sig_reason,
             "url": url,
             "text_len": text_len,
             "han_chars": han,
@@ -968,13 +1000,32 @@ def collect_candidates_from_file(
     doc_id = str(data.get("doc_id") or page_json_path.stem)
     pages = data.get("pages") or []
 
+    # target_lang can be resolved from the pages JSON (propagated from
+    # search_urls → fetch_pages) or from the CLI --direction flag.
+    file_direction = data.get("direction", "vi2zh")
+    direction = getattr(args, "direction", None) or file_direction
+    target_lang = "vi" if direction == "zh2vi" else "zh"
+
+    # New layout stores page text in external files referenced by "text_file"
+    # (relative to the page_dir root). Resolve it against --page_dir. The older
+    # flat layout embeds "text" inline, which we leave untouched.
+    content_root = Path(args.page_dir)
+
     candidates: List[Candidate] = []
     rejected: List[Dict[str, Any]] = []
 
     for idx, page in enumerate(pages, start=1):
+        page = dict(page)
         if "page_id" not in page:
-            page = dict(page)
             page["page_id"] = f"{idx:04d}"
+
+        text_file = page.get("text_file")
+        if text_file and not page.get("text"):
+            text_path = content_root / text_file
+            try:
+                page["text"] = text_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                page["text"] = ""
 
         cand, rej = page_to_candidate(
             page=page,
@@ -993,6 +1044,7 @@ def collect_candidates_from_file(
             vertical_min_lines=args.vertical_min_lines,
             vertical_ratio_threshold=args.vertical_ratio_threshold,
             vertical_avg_len_threshold=args.vertical_avg_len_threshold,
+            target_lang=target_lang,
         )
 
         if cand is not None:
@@ -1082,9 +1134,10 @@ def near_dedup_candidates(
     scope: str,
     trusted_domains: Set[str],
     prefer_traditional: bool = False,
-    prefer_longer: bool = True,  # Default True now
+    prefer_longer: bool = True,
     opencc_converter: Optional[Any] = None,
-    similarity_mode: str = "jaccard",  # "jaccard", "containment", "containment_asym"
+    similarity_mode: str = "jaccard",
+    target_lang: str = "zh",
     verbose: bool = False,
 ) -> Tuple[List[Candidate], List[Dict[str, Any]]]:
     """
@@ -1117,7 +1170,7 @@ def near_dedup_candidates(
     for i, c in enumerate(ordered):
         sig = extreme_clean_for_compare(
             c.text,
-            target_lang="zh",
+            target_lang=target_lang,
             opencc_converter=opencc_converter,
         )
         signatures[i] = sig
@@ -1372,21 +1425,51 @@ def parse_trusted_domains(raw: str) -> Set[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Clean fetch_pages.py JSON outputs, filter by Han ratio, deduplicate, and export .txt files."
+        description=(
+            "Clean fetch_pages.py JSON outputs, filter by language ratio, "
+            "deduplicate, and export .txt files."
+        ),
     )
 
     parser.add_argument("--page_dir", type=str, required=True, help="Directory containing fetch_pages.py JSON outputs.")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to write clean .txt corpus.")
     parser.add_argument("--recursive", action="store_true", help="Recursively read JSON files under --page_dir.")
 
+    # Direction — drives language-ratio filter and dedup signature target.
+    # Auto-detected from each page JSON file (direction field propagated from
+    # build_query → search_urls → fetch_pages) when not set on the CLI.
+    parser.add_argument(
+        "--direction",
+        type=str,
+        default=None,
+        choices=["vi2zh", "zh2vi"],
+        help=(
+            "Pipeline direction. vi2zh: filter/dedup on Han characters (default). "
+            "zh2vi: filter/dedup on Latin/Vietnamese characters. "
+            "If not set, read from each input JSON's 'direction' field."
+        ),
+    )
+
     # Quality gate
     parser.add_argument("--min_text_len", type=int, default=500, help="Minimum cleaned text length.")
-    parser.add_argument("--min_han_chars", type=int, default=100, help="Minimum number of Han characters.")
+    parser.add_argument(
+        "--min_han_chars",
+        type=int,
+        default=100,
+        help=(
+            "Minimum target-language character count. "
+            "Applies to Han chars for vi2zh, Latin chars for zh2vi."
+        ),
+    )
     parser.add_argument(
         "--min_han_ratio",
         type=float,
         default=0.60,
-        help="Minimum Han ratio over Han+Latin characters. Recommended for zh corpus: 0.45-0.70.",
+        help=(
+            "Minimum target-language ratio over Han+Latin characters. "
+            "Applies to Han ratio for vi2zh, Latin ratio for zh2vi. "
+            "Recommended: zh=0.45-0.70, vi=0.50-0.80."
+        ),
     )
     parser.add_argument(
         "--max_text_chars",
@@ -1554,6 +1637,22 @@ def main() -> None:
     flat_output = args.dedup_scope == "global"
     flat_name_mode = "global_id" if flat_output else "doc_id"
 
+    # target_lang is resolved per-file in collect_candidates_from_file using
+    # the 'direction' field embedded in each pages JSON.  When --direction is
+    # set on the CLI it overrides all files; otherwise each file auto-detects.
+    # We also need it here for near_dedup_candidates (corpus-wide operation).
+    # If --direction is set, use it; otherwise peek at the first file.
+    if args.direction:
+        global_target_lang = "vi" if args.direction == "zh2vi" else "zh"
+    else:
+        first_direction = "vi2zh"
+        if json_files:
+            try:
+                first_direction = read_json(json_files[0]).get("direction", "vi2zh")
+            except Exception:
+                pass
+        global_target_lang = "vi" if first_direction == "zh2vi" else "zh"
+
     all_candidates: List[Candidate] = []
     rejected_by_doc: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -1563,6 +1662,7 @@ def main() -> None:
         print(f"[*] Input page_dir: {page_dir}")
         print(f"[*] Output dir:     {output_dir}")
         print(f"[*] JSON files:     {len(json_files)}")
+        print(f"[*] direction:      {args.direction or 'auto-detect'} → target_lang={global_target_lang}")
         print(f"[*] min_han_ratio:  {args.min_han_ratio}")
         print(f"[*] max_file_size:  {args.max_file_size}")
         print(f"[*] drop vertical:  {not args.keep_vertical_ocr}")
@@ -1619,6 +1719,7 @@ def main() -> None:
             prefer_longer=args.prefer_longer,
             opencc_converter=opencc_converter,
             similarity_mode=args.similarity_mode,
+            target_lang=global_target_lang,
             verbose=args.verbose,
         )
         add_rejections_by_doc(rejected_by_doc, near_rejections)
@@ -1646,6 +1747,8 @@ def main() -> None:
         "num_exact_duplicates": len(exact_rejections),
         "num_near_duplicates": len(near_rejections),
         "config": {
+            "direction": args.direction or "auto-detect",
+            "target_lang": global_target_lang,
             "min_text_len": args.min_text_len,
             "min_han_chars": args.min_han_chars,
             "min_han_ratio": args.min_han_ratio,

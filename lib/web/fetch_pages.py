@@ -34,8 +34,10 @@ Required packages:
 
 import argparse
 import asyncio
+import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
@@ -62,8 +64,94 @@ DEFAULT_MIN_TEXT_LEN = 200
 DEFAULT_USER_AGENT = "HistoricalTextFetcher/1.0 (research use)"
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF = 2.0
-DEFAULT_MAX_CONCURRENT = 5      # max concurrent URLs per document
-DEFAULT_MAX_DOC_CONCURRENT = 3  # max documents processed in parallel
+DEFAULT_MAX_CONCURRENT = 10      # max concurrent URL fetches (global)
+
+# Output layout under the page_dir (output_dir):
+#   content/   actual fetched content, deduped globally by canonical-url hash
+#                <hash>.txt  extracted text (web + pdf text layer)
+#                <hash>.pdf  raw file kept only for PDFs (re-extract/OCR later)
+#   docs/      lightweight per-doc index JSON (references content, no inline text)
+#   _registry.json  canonical_url -> fetch result (cross-doc dedup + incremental)
+CONTENT_SUBDIR = "content"
+DOCS_SUBDIR = "docs"
+REGISTRY_NAME = "_registry.json"
+
+
+def url_hash(canonical_url: str) -> str:
+    """Stable 16-char hex hash of a canonical URL — used as a dedup key and
+    short disambiguating suffix on content filenames."""
+    return hashlib.sha1(canonical_url.encode("utf-8")).hexdigest()[:16]
+
+
+# Domains to skip entirely — no fetch, no text extraction.
+# Match is exact on the lowercased host after stripping "www.".
+# Add entries here to extend the blocklist.
+BLOCKED_DOMAINS: frozenset = frozenset([
+    # Video platforms
+    "youtube.com", "youtu.be",
+    "tiktok.com",
+    "vimeo.com",
+    "dailymotion.com",
+    "twitch.tv",
+    "instagram.com",
+    "facebook.com", "fb.watch",
+    "bilibili.com", "m.bilibili.com",
+    "nicovideo.jp",
+    "rumble.com",
+    "odysee.com",
+    "iqiyi.com",
+    "youku.com",
+    "v.qq.com",
+])
+
+
+def is_blocked_url(url: str) -> bool:
+    """True when the URL's host is in BLOCKED_DOMAINS."""
+    host = urlparse(url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host in BLOCKED_DOMAINS
+
+
+import unicodedata as _ud
+
+def content_stem(
+    url: str,
+    content_kind: str,
+    html_title: str,
+    hash_str: str,
+) -> str:
+    """
+    Build a human-readable filename stem for a content file.
+
+    - PDF / binary: use the last path segment of the URL (original filename).
+    - Web / text:   use the page title, sanitised + short hash suffix so two
+                    pages with the same title don't collide.
+
+    The stem is used for both the .txt and (for PDFs) the raw file.
+    """
+    def _sanitize(s: str, max_len: int = 80) -> str:
+        s = _ud.normalize("NFKC", s)
+        # Replace filesystem-unsafe characters with underscores.
+        s = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", s)
+        # Collapse runs of underscores/spaces.
+        s = re.sub(r"[\s_]+", "_", s).strip("_. ")
+        return s[:max_len].strip("_. ") or "untitled"
+
+    if content_kind == "pdf":
+        # e.g. https://example.com/docs/vhtt2023.pdf  →  vhtt2023
+        path_part = urlparse(url).path.rstrip("/")
+        name = Path(path_part).stem if path_part else ""
+        stem = _sanitize(name) if name else hash_str
+    else:
+        title = (html_title or "").strip()
+        # Remove common site-name suffixes to keep names short.
+        title = re.sub(r"\s*[-|–]\s*(Wikipedia|Wikisource|Wikivoyage|Wikibooks"
+                       r"|Wikimedia|Wiktionary|YouTube|Bilibili).*$",
+                       "", title, flags=re.IGNORECASE)
+        stem = (_sanitize(title) + "__" + hash_str[:8]) if title else hash_str
+
+    return stem
 
 
 # =============================================================================
@@ -341,45 +429,91 @@ def extract_pdf_content(
     }
 
 
-def _extract_from_bytes(
+def _extract_and_save(
     content_kind: str,
     url: str,
     final_url: str,
     content_bytes: bytes,
     charset: str,
+    content_dir: Path,
+    hash_str: str,
     min_text_len: int = DEFAULT_MIN_TEXT_LEN,
     collect_assets: bool = False,
 ) -> Dict[str, Any]:
-    """Synchronous extraction from raw bytes. Safe to run in a thread executor."""
+    """
+    Extract text from raw bytes and write content files to disk.
+
+    Safe to run in a thread executor. Writes:
+      - content/<stem>.txt   extracted text (web: title-based name, pdf: url-filename-based)
+      - content/<stem>.pdf   raw bytes (PDF only — kept for OCR/re-extract)
+
+    Returns extraction metadata plus relative paths of written files (or None).
+    Large content is never returned to the caller — it stays on disk only.
+    """
     if content_kind == "pdf":
-        return extract_pdf_content(
+        extracted = extract_pdf_content(
             pdf_bytes=content_bytes,
             min_text_len=min_text_len,
             collect_assets=collect_assets,
         )
+    else:
+        decoded = content_bytes.decode(charset, errors="replace")
+        if content_kind == "text":
+            extracted = extract_plain_text_content(decoded)
+        else:
+            extracted = extract_html_content(html=decoded, url=final_url, min_text_len=min_text_len)
 
-    text = content_bytes.decode(charset, errors="replace")
+    html_title = extracted.get("html_title", "") or ""
+    text = extracted.get("text", "") or ""
 
-    if content_kind == "text":
-        return extract_plain_text_content(text)
+    # Build a human-readable filename stem (title-based for web, original
+    # filename for PDFs), with a short hash suffix to prevent collisions.
+    stem = content_stem(url=url, content_kind=content_kind,
+                        html_title=html_title, hash_str=hash_str)
 
-    return extract_html_content(html=text, url=final_url, min_text_len=min_text_len)
+    text_file = None
+    raw_file = None
 
+    if text.strip():
+        content_dir.mkdir(parents=True, exist_ok=True)
+        (content_dir / f"{stem}.txt").write_text(text, encoding="utf-8")
+        text_file = f"{CONTENT_SUBDIR}/{stem}.txt"
 
-def _error_result(error: str) -> Dict[str, Any]:
+    # PDF: also keep the raw file for future OCR / re-extraction.
+    if content_kind == "pdf":
+        content_dir.mkdir(parents=True, exist_ok=True)
+        (content_dir / f"{stem}.pdf").write_bytes(content_bytes)
+        raw_file = f"{CONTENT_SUBDIR}/{stem}.pdf"
+
     return {
+        "extractor": extracted.get("extractor", ""),
+        "html_title": html_title,
+        "text_len": extracted.get("text_len", 0),
+        "needs_ocr": extracted.get("needs_ocr", False),
+        "assets": extracted.get("assets", []),
+        "text_file": text_file,
+        "raw_file": raw_file,
+    }
+
+
+def _error_entry(canonical_url: str, hash_str: str, error: str) -> Dict[str, Any]:
+    """Registry entry for a URL that failed to fetch/extract."""
+    return {
+        "hash": hash_str,
+        "canonical_url": canonical_url,
+        "final_url": "",
         "status": "error",
         "http_status": None,
-        "final_url": "",
         "content_type": "",
         "content_kind": "unknown",
         "extractor": "",
         "html_title": "",
-        "text": "",
         "text_len": 0,
         "needs_ocr": False,
-        "assets": [],
+        "text_file": None,
+        "raw_file": None,
         "error": error,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -421,9 +555,10 @@ async def _do_fetch(
     return result
 
 
-async def fetch_and_extract_async(
+async def fetch_and_save_async(
     session: aiohttp.ClientSession,
-    url: str,
+    canonical_url: str,
+    content_dir: Path,
     semaphore: asyncio.Semaphore,
     sleep_range: Tuple[float, float] = DEFAULT_SLEEP_RANGE,
     timeout: int = DEFAULT_TIMEOUT,
@@ -433,7 +568,10 @@ async def fetch_and_extract_async(
     retry_backoff: float = DEFAULT_RETRY_BACKOFF,
 ) -> Dict[str, Any]:
     """
-    Fetch one URL and extract content with retry and exponential backoff.
+    Fetch one URL, extract + write content to disk, and return a registry entry.
+
+    The returned dict contains only metadata + relative content paths (no inline
+    text/bytes), so it can be stored in _registry.json and shared across docs.
 
     Retries on:
         - Network / connection errors (aiohttp.ClientError)
@@ -441,18 +579,23 @@ async def fetch_and_extract_async(
         - HTTP 5xx (server errors)
         - HTTP 429 (rate limited, longer backoff)
     """
+    hash_str = url_hash(canonical_url)
+
+    if is_blocked_url(canonical_url):
+        return _error_entry(canonical_url, hash_str, "skipped:blocked_domain")
+
     last_error = "unknown error"
 
     for attempt in range(max_retries + 1):
         try:
-            raw = await _do_fetch(session, url, semaphore, timeout, sleep_range)
+            raw = await _do_fetch(session, canonical_url, semaphore, timeout, sleep_range)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < max_retries:
                 await asyncio.sleep(retry_backoff ** attempt)
             continue
         except Exception as exc:
-            return _error_result(str(exc))
+            return _error_entry(canonical_url, hash_str, str(exc))
 
         http_status = raw["status_code"]
 
@@ -468,8 +611,8 @@ async def fetch_and_extract_async(
                 await asyncio.sleep(retry_backoff ** attempt)
             continue
 
-        # Successful response — extract content in thread pool so CPU-bound
-        # work (trafilatura, fitz) does not block the event loop.
+        # Successful response — extract + write files in a thread pool so the
+        # CPU-bound work (trafilatura, fitz) and disk I/O do not block the loop.
         try:
             content_kind = detect_content_kind(
                 url=raw["final_url"],
@@ -481,191 +624,135 @@ async def fetch_and_extract_async(
 
             charset = _detect_charset(raw["content_type"])
 
-            extracted = await asyncio.to_thread(
-                _extract_from_bytes,
+            saved = await asyncio.to_thread(
+                _extract_and_save,
                 content_kind,
-                url,
+                canonical_url,
                 raw["final_url"],
                 raw["content_bytes"],
                 charset,
+                content_dir,
+                hash_str,
                 min_text_len,
                 collect_assets,
             )
 
             return {
+                "hash": hash_str,
+                "canonical_url": canonical_url,
+                "final_url": raw["final_url"],
                 "status": "ok",
                 "http_status": http_status,
-                "final_url": raw["final_url"],
                 "content_type": raw["content_type"],
                 "content_kind": content_kind,
-                "extractor": extracted.get("extractor", ""),
-                "html_title": extracted.get("html_title", ""),
-                "text": extracted.get("text", ""),
-                "text_len": extracted.get("text_len", 0),
-                "needs_ocr": extracted.get("needs_ocr", False),
-                "assets": extracted.get("assets", []),
+                "extractor": saved["extractor"],
+                "html_title": saved["html_title"],
+                "text_len": saved["text_len"],
+                "needs_ocr": saved["needs_ocr"],
+                "assets": saved["assets"],
+                "text_file": saved["text_file"],
+                "raw_file": saved["raw_file"],
                 "error": "",
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
             }
         except Exception as exc:
-            return _error_result(str(exc))
+            return _error_entry(canonical_url, hash_str, str(exc))
 
-    return _error_result(last_error)
+    return _error_entry(canonical_url, hash_str, last_error)
 
 
 # =============================================================================
-# FILE RUNNER
+# REGISTRY (cross-doc dedup + incremental)
 # =============================================================================
 
-async def fetch_one_url_file_async(
-    url_path: Path,
-    output_path: Path,
-    sleep_range: Tuple[float, float] = DEFAULT_SLEEP_RANGE,
-    timeout: int = DEFAULT_TIMEOUT,
-    min_text_len: int = DEFAULT_MIN_TEXT_LEN,
-    user_agent: str = DEFAULT_USER_AGENT,
-    collect_assets: bool = False,
-    max_retries: int = DEFAULT_MAX_RETRIES,
-    retry_backoff: float = DEFAULT_RETRY_BACKOFF,
-    max_concurrent: int = DEFAULT_MAX_CONCURRENT,
-    skip_existing: bool = True,
+def load_registry(path: Path) -> Dict[str, Any]:
+    """Load the canonical_url -> fetch-entry registry, or {} if missing/corrupt."""
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_registry(path: Path, registry: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(registry, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+# =============================================================================
+# PER-DOC INDEX
+# =============================================================================
+
+def build_doc_index(
+    doc_id: str,
+    direction: str,
+    source_url_path: str,
+    grouped_items: List[Dict[str, Any]],
+    registry: Dict[str, Any],
+    *,
     full_output: bool = False,
-    verbose: bool = False,
-) -> None:
-    if skip_existing and output_path.exists():
-        if verbose:
-            print(f"[skip] {output_path.name} (already exists, use --force to re-fetch)")
-        return
+) -> Dict[str, Any]:
+    """
+    Build a lightweight per-doc index referencing content files in the store.
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with url_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    doc_id = data.get("doc_id", url_path.stem)
-    url_records = list(iter_url_records(data))
-    grouped_urls = group_duplicate_urls(url_records)
-
-    if verbose:
-        print(f"\n=== Fetching pages for {doc_id} ===")
-        print(f"URL file: {url_path}")
-        print(f"Raw URL records: {len(url_records)}")
-        print(f"Unique canonical URLs: {len(grouped_urls)}")
-        print(f"Max concurrent: {max_concurrent}, Max retries: {max_retries}")
-        print(f"Output file: {output_path}")
-
-    semaphore = asyncio.Semaphore(max_concurrent)
-    connector = aiohttp.TCPConnector(limit=max_concurrent * 2)
-    headers = {"User-Agent": user_agent}
-
-    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        tasks = [
-            fetch_and_extract_async(
-                session=session,
-                url=item["canonical_url"],
-                semaphore=semaphore,
-                sleep_range=sleep_range,
-                timeout=timeout,
-                min_text_len=min_text_len,
-                collect_assets=collect_assets,
-                max_retries=max_retries,
-                retry_backoff=retry_backoff,
-            )
-            for item in grouped_urls
-        ]
-        fetch_results = await asyncio.gather(*tasks)
-
+    Each page record carries doc-specific metadata (title/snippet/source_queries
+    from search) plus the shared fetch result (status, content_kind, text_file,
+    raw_file, ...) looked up from the global registry. No inline page text.
+    """
     pages: List[Dict[str, Any]] = []
 
-    for idx, (item, fetch_result) in enumerate(zip(grouped_urls, fetch_results), start=1):
-        canonical_url = item["canonical_url"]
-        page_id = f"{idx:04d}"
-
-        if verbose:
-            status = fetch_result.get("status", "error")
-            err = fetch_result.get("error", "")
-            suffix = f" ({err})" if err else ""
-            print(f"[{idx}/{len(grouped_urls)}] {status.upper()}{suffix} {canonical_url}")
-
-        domain = urlparse(canonical_url).netloc.lower()
+    for idx, item in enumerate(grouped_items, start=1):
+        cu = item["canonical_url"]
+        reg = registry.get(cu, {})
+        domain = urlparse(cu).netloc.lower()
 
         page = {
-            "page_id": page_id,
+            "page_id": f"{idx:04d}",
             "doc_id": doc_id,
-
             "url": item.get("url", ""),
-            "canonical_url": canonical_url,
-            "final_url": fetch_result["final_url"],
+            "canonical_url": cu,
+            "final_url": reg.get("final_url", ""),
             "domain": domain,
-
             "title": item.get("title", ""),
-            "html_title": fetch_result["html_title"],
-            "snippet": item.get("snippet", ""),
-            "source_block": item.get("source_block", ""),
-
-            "status": fetch_result["status"],
-            "http_status": fetch_result["http_status"],
-            "content_type": fetch_result["content_type"],
-            "content_kind": fetch_result["content_kind"],
-            "extractor": fetch_result["extractor"],
-
-            "text_len": fetch_result["text_len"],
-            "needs_ocr": fetch_result["needs_ocr"],
-            "assets": fetch_result.get("assets", []),
-            "error": fetch_result["error"],
-
+            "html_title": reg.get("html_title", ""),
+            "status": reg.get("status", "error"),
+            "content_kind": reg.get("content_kind", "unknown"),
+            "extractor": reg.get("extractor", ""),
+            "needs_ocr": reg.get("needs_ocr", False),
+            "error": reg.get("error", "" if reg else "not_fetched"),
+            "content_hash": reg.get("hash", url_hash(cu)),
+            "text_file": reg.get("text_file"),
+            "raw_file": reg.get("raw_file"),
             "source_queries": item.get("source_queries", []),
-            "text": fetch_result["text"],
         }
+
+        if full_output:
+            page.update({
+                "http_status": reg.get("http_status"),
+                "content_type": reg.get("content_type", ""),
+                "text_len": reg.get("text_len", 0),
+                "snippet": item.get("snippet", ""),
+                "source_block": item.get("source_block", ""),
+                "assets": reg.get("assets", []),
+                "fetched_at": reg.get("fetched_at"),
+            })
 
         pages.append(page)
 
-    output = {
+    return {
         "doc_id": doc_id,
-        "source_url_path": str(url_path),
-        "num_raw_url_records": len(url_records),
-        "num_unique_urls": len(grouped_urls),
+        "direction": direction,
+        "source_url_path": source_url_path,
         "num_pages": len(pages),
         "num_fetch_ok": sum(1 for p in pages if p["status"] == "ok"),
         "num_fetch_error": sum(1 for p in pages if p["status"] != "ok"),
         "num_needs_ocr": sum(1 for p in pages if p.get("needs_ocr")),
-        "num_assets": sum(len(p.get("assets", [])) for p in pages),
         "pages": pages,
     }
-
-    # By default, persist only the page fields the next step (export_clean_txt.py)
-    # reads, plus light traceability metadata. Drop snippet/source_block,
-    # http_status, content_type, text_len and assets (recomputed or unused
-    # downstream). Use --full_output to keep everything.
-    if full_output:
-        final_output = output
-    else:
-        minimal_page_fields = (
-            "page_id", "doc_id",
-            "url", "canonical_url", "final_url", "domain",
-            "title", "html_title",
-            "status", "content_kind", "extractor",
-            "needs_ocr", "error",
-            "source_queries", "text",
-        )
-        final_output = {
-            "doc_id": doc_id,
-            "source_url_path": str(url_path),
-            "pages": [
-                {k: page.get(k) for k in minimal_page_fields}
-                for page in pages
-            ],
-        }
-
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(final_output, f, ensure_ascii=False, indent=2)
-
-    if verbose:
-        print(f"\nSaved fetched pages to: {output_path}")
-        print(f"Pages: {len(pages)}")
-        print(f"Fetch ok: {output['num_fetch_ok']}")
-        print(f"Fetch error: {output['num_fetch_error']}")
-        print(f"Assets: {output['num_assets']}")
-        print(f"Needs OCR: {output['num_needs_ocr']}")
 
 
 def collect_json_files(input_dir: Path, recursive: bool = False) -> List[Path]:
@@ -680,67 +767,114 @@ def collect_json_files(input_dir: Path, recursive: bool = False) -> List[Path]:
 
 async def _async_main(args: argparse.Namespace) -> None:
     sleep_range = tuple(args.sleep_range)
-    skip_existing = not args.force
 
+    page_dir = Path(args.output_dir)
+    content_dir = page_dir / CONTENT_SUBDIR
+    docs_dir = page_dir / DOCS_SUBDIR
+    registry_path = page_dir / REGISTRY_NAME
+    docs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect input URL JSON files (output of search_urls.py).
     if args.url_path:
-        await fetch_one_url_file_async(
-            url_path=Path(args.url_path),
-            output_path=Path(args.output_path),
-            sleep_range=sleep_range,
-            timeout=args.timeout,
-            min_text_len=args.min_text_len,
-            collect_assets=args.collect_assets,
-            user_agent=args.user_agent,
-            max_retries=args.max_retries,
-            retry_backoff=args.retry_backoff,
-            max_concurrent=args.max_concurrent,
-            skip_existing=skip_existing,
-            full_output=args.full_output,
-            verbose=args.verbose,
-        )
+        url_root = Path(args.url_path).parent
+        url_files = [Path(args.url_path)]
     else:
-        url_dir = Path(args.url_dir)
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        url_files = collect_json_files(url_dir, recursive=args.recursive)
-
+        url_root = Path(args.url_dir)
+        url_files = collect_json_files(url_root, recursive=args.recursive)
         if not url_files:
-            raise FileNotFoundError(f"No JSON files found in {url_dir}")
+            raise FileNotFoundError(f"No JSON files found in {url_root}")
 
-        print(f"Found {len(url_files)} URL JSON files "
-              f"(max_doc_concurrent={args.max_doc_concurrent})")
+    # ── Phase 1: load every doc, group URLs per doc, collect the global set ──
+    docs: List[Dict[str, Any]] = []
+    global_urls: Dict[str, None] = {}
 
-        # Document-level semaphore: limits how many docs are fetched in parallel.
-        # Each doc independently uses its own per-URL semaphore (max_concurrent).
-        doc_sem = asyncio.Semaphore(args.max_doc_concurrent)
+    for url_file in url_files:
+        with url_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
 
-        async def _fetch_doc(idx: int, url_file: Path) -> None:
-            rel_path = url_file.relative_to(url_dir)
-            output_path = output_dir / rel_path.with_suffix(".json")
-            async with doc_sem:
-                if args.verbose:
-                    print(f"[{idx}/{len(url_files)}] {url_file.name}")
-                await fetch_one_url_file_async(
-                    url_path=url_file,
-                    output_path=output_path,
+        doc_id = data.get("doc_id", url_file.stem)
+        direction = data.get("direction", "vi2zh")
+        grouped = group_duplicate_urls(iter_url_records(data))
+
+        for item in grouped:
+            global_urls.setdefault(item["canonical_url"], None)
+
+        if args.url_path:
+            out_path = docs_dir / f"{doc_id}.json"
+        else:
+            out_path = docs_dir / url_file.relative_to(url_root).with_suffix(".json")
+
+        docs.append({
+            "doc_id": doc_id,
+            "direction": direction,
+            "source_url_path": str(url_file),
+            "grouped": grouped,
+            "out_path": out_path,
+        })
+
+    # ── Phase 2: fetch each unique URL once (cross-doc dedup + incremental) ──
+    registry = load_registry(registry_path)
+    pending = [cu for cu in global_urls if args.force or cu not in registry]
+
+    print(
+        f"Docs: {len(docs)} | unique URLs: {len(global_urls)} | "
+        f"to fetch: {len(pending)} | cached: {len(global_urls) - len(pending)}"
+    )
+
+    if pending:
+        semaphore = asyncio.Semaphore(args.max_concurrent)
+        connector = aiohttp.TCPConnector(limit=args.max_concurrent * 2)
+        headers = {"User-Agent": args.user_agent}
+
+        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
+            tasks = [
+                fetch_and_save_async(
+                    session=session,
+                    canonical_url=cu,
+                    content_dir=content_dir,
+                    semaphore=semaphore,
                     sleep_range=sleep_range,
                     timeout=args.timeout,
                     min_text_len=args.min_text_len,
                     collect_assets=args.collect_assets,
-                    user_agent=args.user_agent,
                     max_retries=args.max_retries,
                     retry_backoff=args.retry_backoff,
-                    max_concurrent=args.max_concurrent,
-                    skip_existing=skip_existing,
-                    full_output=args.full_output,
-                    verbose=args.verbose,
                 )
+                for cu in pending
+            ]
 
-        await asyncio.gather(*[
-            _fetch_doc(idx, url_file)
-            for idx, url_file in enumerate(url_files, start=1)
-        ])
+            done = 0
+            for fut in asyncio.as_completed(tasks):
+                entry = await fut
+                registry[entry["canonical_url"]] = entry
+                done += 1
+                if args.verbose:
+                    err = f" ({entry['error']})" if entry.get("error") else ""
+                    print(f"[{done}/{len(pending)}] {entry['status'].upper()}{err} "
+                          f"{entry['canonical_url']}")
+
+        save_registry(registry_path, registry)
+
+    # ── Phase 3: write per-doc index JSON referencing the content store ──
+    for d in docs:
+        output = build_doc_index(
+            doc_id=d["doc_id"],
+            direction=d["direction"],
+            source_url_path=d["source_url_path"],
+            grouped_items=d["grouped"],
+            registry=registry,
+            full_output=args.full_output,
+        )
+        d["out_path"].parent.mkdir(parents=True, exist_ok=True)
+        with d["out_path"].open("w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
+
+        if args.verbose:
+            print(f"[index] {d['out_path']} "
+                  f"(pages={output['num_pages']}, ok={output['num_fetch_ok']}, "
+                  f"err={output['num_fetch_error']})")
+
+    print(f"Done. Registry: {len(registry)} URLs | content: {content_dir} | index: {docs_dir}")
 
 
 def main():
@@ -751,7 +885,8 @@ def main():
     parser.add_argument("--url_path", type=str, default=None)
     parser.add_argument("--url_dir", type=str, default=None)
 
-    parser.add_argument("--output_path", type=str, default=None)
+    # Output is always a directory (the "page_dir"): it holds content/, docs/
+    # and _registry.json. Works for both --url_path and --url_dir.
     parser.add_argument("--output_dir", type=str, default=None)
 
     parser.add_argument("--recursive", action="store_true")
@@ -784,13 +919,13 @@ def main():
         "--max_concurrent",
         type=int,
         default=DEFAULT_MAX_CONCURRENT,
-        help="Maximum number of concurrent fetch requests per document (default: 5)",
+        help="Maximum number of concurrent URL fetches, globally (default: 5)",
     )
     parser.add_argument(
         "--max_doc_concurrent",
         type=int,
-        default=DEFAULT_MAX_DOC_CONCURRENT,
-        help="Maximum number of documents fetched in parallel (default: 3)",
+        default=3,
+        help="Deprecated/ignored: fetching is now global across docs, not per-doc.",
     )
     parser.add_argument(
         "--max_retries",
@@ -809,14 +944,15 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-fetch even if the output file already exists (default: skip existing)",
+        help="Re-fetch every URL even if already in the registry (default: skip cached).",
     )
 
     parser.add_argument(
         "--full_output",
         action="store_true",
         help=(
-            "Persist all page fields and document counters. Default keeps only "
+            "Add diagnostic fields to the per-doc index (http_status, content_type, "
+            "text_len, snippet, source_block, assets, fetched_at). Default keeps only "
             "the fields the next step (export_clean_txt.py) reads."
         ),
     )
@@ -828,11 +964,8 @@ def main():
     if bool(args.url_path) == bool(args.url_dir):
         raise ValueError("Provide exactly one of --url_path or --url_dir")
 
-    if args.url_path and not args.output_path:
-        raise ValueError("--output_path is required when using --url_path")
-
-    if args.url_dir and not args.output_dir:
-        raise ValueError("--output_dir is required when using --url_dir")
+    if not args.output_dir:
+        raise ValueError("--output_dir is required")
 
     asyncio.run(_async_main(args))
 

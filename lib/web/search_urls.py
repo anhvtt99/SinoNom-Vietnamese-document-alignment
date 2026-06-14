@@ -104,7 +104,19 @@ def search_one_query_file(
     if args.top_queries is not None:
         query_items = query_items[:args.top_queries]
 
-    search_kwargs = build_search_kwargs(args)
+    # Resolve hl: if not explicitly set, derive from the direction embedded in
+    # the query JSON (written by build_query.py).
+    #   vi2zh → hl=zh-cn  (return Chinese-language results)
+    #   zh2vi → hl=vi     (return Vietnamese-language results)
+    if args.hl is None:
+        import copy
+        direction = data.get("direction", "vi2zh")
+        effective_args = copy.copy(args)
+        effective_args.hl = "vi" if direction == "zh2vi" else "zh-cn"
+    else:
+        effective_args = args
+
+    search_kwargs = build_search_kwargs(effective_args)
 
     query_results: List[Dict[str, Any]] = []
     query_errors: List[Dict[str, Any]] = []
@@ -236,7 +248,7 @@ def search_one_query_file(
             "fallback_num_results": args.fallback_num_results,
             "top_queries": args.top_queries,
             "gl": args.gl,
-            "hl": args.hl,
+            "hl": effective_args.hl,
             "location": args.location,
             "include_omitted": args.include_omitted,
             "filter": 0 if args.include_omitted else None,
@@ -263,6 +275,7 @@ def search_one_query_file(
     else:
         final_output = {
             "doc_id": doc_id,
+            "direction": data.get("direction", "vi2zh"),
             "source_query_path": str(query_path),
             "query_results": [
                 {
@@ -343,8 +356,12 @@ def main():
     parser.add_argument(
         "--hl",
         type=str,
-        default="zh-cn",
-        help="Google UI language passed to search backend",
+        default=None,
+        help=(
+            "Google UI language passed to search backend. "
+            "Auto-detected from the query JSON direction field if not set: "
+            "vi2zh→zh-cn, zh2vi→vi."
+        ),
     )
 
     parser.add_argument(
