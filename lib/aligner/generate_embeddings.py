@@ -75,6 +75,11 @@ def concat_feature_batches(
     """
     Concatenate tokenized feature dicts from multiple docs.
 
+    ``pad_token_id`` should be the tokenizer's real pad id (0 for BERT/LaBSE,
+    1 for XLM-R/M3); callers pass it so both architectures pad correctly. Padded
+    positions are masked out via attention_mask regardless, so this only keeps
+    the input_ids tensor faithful.
+
     Handles different sequence lengths by padding all tensors to the same L.
 
     Example:
@@ -151,7 +156,12 @@ def _encode_and_save_feature_group(
     if not group_features:
         return
 
-    merged_features = concat_feature_batches(group_features)
+    # Use the model's real pad id (BERT/LaBSE=0, XLM-R/M3=1). Padded positions are
+    # masked out by attention_mask, but keeping the correct id avoids surprises.
+    pad_id = model.tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = 0
+    merged_features = concat_feature_batches(group_features, pad_token_id=pad_id)
 
     emb_all = st_encode_features(
         model,
@@ -213,7 +223,6 @@ def _process_per_doc(
     # chunk split params (only when split_mode="chunk")
     chunk_size: int = 100,
     overlap_rate: int = 0.5,
-    max_tokens: Optional[int] = None,                     # None => use model max_seq_length  
 ) -> None:
     if not docs:
         raise ValueError("docs is empty")
@@ -228,7 +237,7 @@ def _process_per_doc(
         config_tag = f'{split_mode}_s{chunk_size}_r{overlap_rate}'
 
     tok = model.tokenizer
-    max_tokens = max_tokens if max_tokens is not None else model.max_seq_length
+    model_max_len = model.max_seq_length  # model's hard sequence-length limit (auto)
 
 
     # Setup Path
@@ -248,10 +257,10 @@ def _process_per_doc(
     for idx, (doc) in enumerate(docs):
         # get split (with one metadata record per embedding row)
         if split_mode == "sentence":
-            features, records = sent_split_tkn(doc, tok, lang, max_len=max_sent_len, max_tokens=max_tokens, num_of_sent=num_of_sent, overlap_sent=overlap_sent, return_metadata=True)
+            features, records = sent_split_tkn(doc, tok, lang, max_len=max_sent_len, max_tokens=model_max_len, num_of_sent=num_of_sent, overlap_sent=overlap_sent, return_metadata=True)
         else:
             overlap_size = int(chunk_size * overlap_rate)
-            features, records = chunk_split(doc, tok, chunk_size, overlap_size, max_tokens=max_tokens, return_metadata=True)
+            features, records = chunk_split(doc, tok, chunk_size, overlap_size, max_tokens=model_max_len, return_metadata=True)
 
         emb_doc = st_encode_features(
             model,
@@ -299,7 +308,7 @@ def _process_per_doc(
                 "split_mode": split_mode,
                 "chunk_size": chunk_size,
                 "overlap_rate": overlap_rate,
-                "max_tokens": max_tokens,
+                "model_max_len": model_max_len,
         }
     AlignerIO.save_config(lang_path, config_data)
 
@@ -322,7 +331,6 @@ def _process_per_batch(
     # chunk split params
     chunk_size: int = 100,
     overlap_rate: float = 0.5,
-    max_tokens: Optional[int] = None,
 ) -> None:
     """
     Faster embedding generation by batching chunks across multiple documents.
@@ -356,7 +364,7 @@ def _process_per_batch(
         config_tag = f"{split_mode}_s{chunk_size}_r{overlap_rate}"
 
     tok = model.tokenizer
-    max_tokens = max_tokens if max_tokens is not None else model.max_seq_length
+    model_max_len = model.max_seq_length  # model's hard sequence-length limit (auto)
 
     print(f"[{config_tag}] Constructing embedding output file system...")
     lang_path = Path(embeddings_output) / config_tag / lang
@@ -386,7 +394,7 @@ def _process_per_batch(
                 tok,
                 lang,
                 max_len=max_sent_len,
-                max_tokens=max_tokens,
+                max_tokens=model_max_len,
                 num_of_sent=num_of_sent,
                 overlap_sent=overlap_sent,
                 return_metadata=True,
@@ -398,7 +406,7 @@ def _process_per_batch(
                 tok,
                 chunk_size,
                 overlap_size,
-                max_tokens=max_tokens,
+                max_tokens=model_max_len,
                 return_metadata=True,
             )
 
@@ -497,7 +505,7 @@ def _process_per_batch(
             "split_mode": split_mode,
             "chunk_size": chunk_size,
             "overlap_rate": overlap_rate,
-            "max_tokens": max_tokens,
+            "model_max_len": model_max_len,
             "batch_size": batch_size,
             "encode_group_size": encode_group_size,
         }
@@ -528,9 +536,10 @@ def main():
     parser.add_argument("--max_sent_len", type=int, default=10000, help="Maximum sentence length in characters.")
     
     # Chunk split specific
-    parser.add_argument("--chunk_size", type=int, default=100, help="Chunk size in tokens (if split_mode=chunk).")
+    parser.add_argument("--chunk_size", type=int, default=100,
+                        help="Chunk size in tokens (if split_mode=chunk). The model's sequence-length "
+                             "limit is applied automatically; chunks exceeding it are clamped with a warning.")
     parser.add_argument("--overlap_rate", type=float, default=0.5, help="Overlap rate for chunks (0.0 to 1.0).")
-    parser.add_argument("--max_tokens", type=int, default=None, help="Force maximum tokens (defaults to model's max_seq_length).")
 
     # Process mode config
     parser.add_argument(
@@ -591,7 +600,6 @@ def main():
             max_sent_len=args.max_sent_len,
             chunk_size=args.chunk_size,
             overlap_rate=args.overlap_rate,
-            max_tokens=args.max_tokens,
         )
     else:
         process_fn(
@@ -607,7 +615,6 @@ def main():
             max_sent_len=args.max_sent_len,
             chunk_size=args.chunk_size,
             overlap_rate=args.overlap_rate,
-            max_tokens=args.max_tokens,
         )
 
 def run_embedding_generation(
@@ -625,7 +632,6 @@ def run_embedding_generation(
     max_sent_len: int = 10000,
     chunk_size: int = 100,
     overlap_rate: float = 0.5,
-    max_tokens=None,
     file_ext: str = ".txt",
 ) -> None:
     """
@@ -657,7 +663,6 @@ def run_embedding_generation(
             max_sent_len=max_sent_len,
             chunk_size=chunk_size,
             overlap_rate=overlap_rate,
-            max_tokens=max_tokens,
         )
     else:
         process_fn(
@@ -673,7 +678,6 @@ def run_embedding_generation(
             max_sent_len=max_sent_len,
             chunk_size=chunk_size,
             overlap_rate=overlap_rate,
-            max_tokens=max_tokens,
         )
 
 

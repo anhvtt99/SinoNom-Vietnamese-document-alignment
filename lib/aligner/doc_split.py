@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+import warnings
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -259,12 +260,27 @@ def sent_split_tkn(
         max_length=max_tokens,
         return_tensors="pt",
         return_attention_mask=True,
+        verbose=False,
     )
 
     features = {
         "input_ids": enc["input_ids"].long(),
         "attention_mask": enc["attention_mask"].long(),
     }
+
+    # When truncation is on, any row whose tokenized length reaches max_tokens has
+    # very likely lost content. Warn (once per call) with how many rows hit it.
+    if max_tokens is not None:
+        row_lengths = features["attention_mask"].sum(dim=1)
+        n_truncated = int((row_lengths >= max_tokens).sum())
+        if n_truncated:
+            warnings.warn(
+                f"sent_split_tkn: {n_truncated}/{len(grouped_text)} row(s) in "
+                f"'{Path(file_path).name}' reached the model limit ({max_tokens} tokens) "
+                f"and were truncated (content lost). Lower --num_of_sent or use a "
+                f"longer-context model.",
+                stacklevel=2,
+            )
 
     if not return_metadata:
         return features
@@ -314,30 +330,52 @@ def chunk_split(
 
     # Tokenize full doc once. Request offset_mapping for char offsets (fast
     # tokenizers only); degrade gracefully if unavailable.
+    #
+    # verbose=False suppresses the tokenizer's "Token indices sequence length is
+    # longer than the specified maximum..." advisory: we tokenize the whole doc
+    # only to window it into chunks, and the full sequence is never run through
+    # the model, so that warning is a false alarm here.
     offsets: Optional[List[Tuple[int, int]]] = None
     if return_metadata:
         try:
             enc = tokenizer(
                 norm, add_special_tokens=False, truncation=False,
-                return_offsets_mapping=True,
+                return_offsets_mapping=True, verbose=False,
             )
             ids = enc["input_ids"]
             offsets = [tuple(o) for o in enc["offset_mapping"]]
         except Exception:
-            ids = tokenizer(norm, add_special_tokens=False, truncation=False)["input_ids"]
+            ids = tokenizer(norm, add_special_tokens=False, truncation=False, verbose=False)["input_ids"]
             offsets = None
     else:
-        ids = tokenizer(norm, add_special_tokens=False, truncation=False)["input_ids"]
+        ids = tokenizer(norm, add_special_tokens=False, truncation=False, verbose=False)["input_ids"]
 
     if not ids:
         return (_empty_features(), []) if return_metadata else _empty_features()
 
     cls_id = tokenizer.cls_token_id
     sep_id = tokenizer.sep_token_id
-    chunk_size = min(chunk_size, max_tokens - 2)
+
+    # A chunk is [CLS] + chunk_size tokens + [SEP], so it must fit in max_tokens.
+    # If the requested chunk_size doesn't fit, clamp it -- and warn, because the
+    # effective chunk size is then smaller than what the user asked for.
+    effective_chunk_size = min(chunk_size, max_tokens - 2)
+    if effective_chunk_size < chunk_size:
+        warnings.warn(
+            f"chunk_split: requested chunk_size={chunk_size} exceeds the model's "
+            f"limit (max_seq_length-2={max_tokens - 2}); clamping to "
+            f"{effective_chunk_size}. Chunks will hold at most {effective_chunk_size} "
+            f"tokens. Use a longer-context model (or raise model.max_seq_length) "
+            f"for larger chunks.",
+            stacklevel=2,
+        )
+    chunk_size = effective_chunk_size
     step = chunk_size - overlap_size
     if step <= 0:
-        raise ValueError("overlap_size too large (step <= 0)")
+        raise ValueError(
+            f"step <= 0: overlap_size={overlap_size} is too large for effective "
+            f"chunk_size={chunk_size}"
+        )
 
     chunks: List[List[int]] = []
     spans: List[Tuple[int, int]] = []  # token index ranges [start, end)

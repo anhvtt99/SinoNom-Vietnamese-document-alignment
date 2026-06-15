@@ -728,8 +728,10 @@ def build_span_parser():
                         help="Directory for localized_spans_<config>.tsv (default: cwd)")
 
     # Pair selection
-    parser.add_argument("--localize_top_k_pairs", type=int, default=3,
-                        help="Per source doc, localize at most this many top target candidates.")
+    parser.add_argument("--localize_top_k_pairs", type=int, default=None,
+                        help="Per source doc, localize at most this many top target candidates. "
+                             "Default None: use all pairs from the alignment TSV (already bounded "
+                             "by --top_k_pairs in the aligner step).")
 
     # Window search hyperparameters
     parser.add_argument("--span_window_multipliers", type=float, nargs="+",

@@ -140,12 +140,34 @@ def select_pairs(D_margin: np.ndarray, I_margin: np.ndarray, args) -> List[Tuple
 
 def retrieve_and_rerank(src_emb_path: Path, trg_emb_path: Path, args, device: str) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Run retrieval -> Bimax rerank -> CSLS margin, returning (D_margin, I_margin).
+    Run retrieval -> Bimax rerank -> scoring, returning (D_scores, I_scores).
 
-    Both FAISS indices are built once and reused for the two retrieval
-    directions feeding CSLS.
+    Two modes (``args.score_mode``):
+    - ``"csls"`` (default): bidirectional retrieval + Bimax rerank + CSLS margin.
+      Corrects for hubness; needs two FAISS indices and two Bimax passes.
+    - ``"bimax"``: src→tar only; raw Bimax scores returned directly. ~2× faster;
+      hubness is not corrected. Suits m-m mode where hubness matters less.
     """
-    # --- STAGE 1: INITIAL RETRIEVAL ---
+    bimax_aggregation = "max" if args.align_mode == "m-m" else "avg"
+    score_mode = getattr(args, "score_mode", "csls")
+
+    if score_mode == "bimax":
+        # --- BIMAX MODE: single direction, no CSLS ---
+        print("\n[1/2] Building Initial Retrieval Matrix (src→tar)...")
+        retriever_target = VotingParentRetriever()
+        retriever_target.load_target_corpus(trg_emb_path)
+        _, I_trg = build_retrieval_matrix(
+            src_emb_path, trg_emb_path,
+            top_k_chunks=args.top_k_chunks, top_k_docs=args.top_k_docs, retriever=retriever_target,
+        )
+        print("[2/2] Performing Bimax Reranking (src→tar)...")
+        D_bimax, I_bimax = rerank_bimax(
+            I_trg, src_emb_path, trg_emb_path,
+            normalize=False, trim_ratio=args.bimax_trim_ratio, device=device, aggregation=bimax_aggregation,
+        )
+        return D_bimax, I_bimax
+
+    # --- CSLS MODE (default): bidirectional ---
     print("\n[1/3] Building Initial Retrieval Matrices...")
     retriever_target = VotingParentRetriever()   # target corpus indexed; queried by source
     retriever_target.load_target_corpus(trg_emb_path)
@@ -161,10 +183,6 @@ def retrieve_and_rerank(src_emb_path: Path, trg_emb_path: Path, args, device: st
         top_k_chunks=args.top_k_chunks, top_k_docs=args.top_k_docs, retriever=retriever_source,
     )
 
-    # --- STAGE 2: RERANKING (BIMAX) ---
-    # 'max' favours partial/containment matches (m-m); 'avg' verifies global
-    # similarity for unique mappings (1-1).
-    bimax_aggregation = "max" if args.align_mode == "m-m" else "avg"
     print("[2/3] Performing Bimax Reranking...")
     D_trg, I_trg_reranked = rerank_bimax(
         I_trg, src_emb_path, trg_emb_path,
@@ -175,7 +193,6 @@ def retrieve_and_rerank(src_emb_path: Path, trg_emb_path: Path, args, device: st
         normalize=False, trim_ratio=args.bimax_trim_ratio, device=device, aggregation=bimax_aggregation,
     )
 
-    # --- STAGE 3: CSLS MARGIN ---
     print("[3/3] Computing CSLS Margin...")
     D_margin, I_margin = compute_csls(
         D_trg, I_trg_reranked, D_src, I_src_reranked,
@@ -268,13 +285,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top_k_chunks", type=int, default=5, help="Top K chunks to retrieve initially")
     parser.add_argument("--top_k_docs", type=int, default=10, help="Top K documents to retrieve initially")
     parser.add_argument("--bimax_trim_ratio", type=float, default=0.7, help="Trim ratio for Bimax reranking")
-    parser.add_argument("--csls_k", type=int, default=10, help="K nearest neighbors for CSLS margin")
-    parser.add_argument("--csls_top_k_out", type=int, default=10, help="Top K output edges per document in CSLS")
+    parser.add_argument("--score_mode", type=str, choices=["csls", "bimax"], default="csls",
+                        help="Final scoring method: 'csls' (default) bidirectional Bimax + CSLS margin "
+                             "(corrects hubness); 'bimax' src→tar Bimax only, ~2× faster.")
+    parser.add_argument("--csls_k", type=int, default=10, help="K nearest neighbors for CSLS margin (csls mode only)")
+    parser.add_argument("--csls_top_k_out", type=int, default=10, help="Top K output edges per document in CSLS (csls mode only)")
 
     # 4b. Edge selection
     parser.add_argument("--top_k_pairs", type=int, default=5,
-                        help="m-m mode: number of target candidates kept per source (ranked by CSLS). "
-                             "Capped by --csls_top_k_out.")
+                        help="m-m mode: number of target candidates kept per source. "
+                             "In csls mode, capped by --csls_top_k_out.")
     parser.add_argument("--edge_threshold", type=float, default=None,
                         help="Optional score floor. 1-1 mode defaults to 0.08 when unset; "
                              "m-m mode applies no floor unless set.")
@@ -297,6 +317,7 @@ def main():
     config_tag = build_config_tag(args)
     print(f"[*] Processing alignment for config: {config_tag}")
     print(f"[*] Source language: {args.src_lang} | Target language: {args.tar_lang}")
+    print(f"[*] Align mode: {args.align_mode} | Score mode: {args.score_mode}")
 
     pairs, src_meta_df, trg_meta_df, src_emb_path, trg_emb_path, config_tag = align_documents(args, device)
     print(f"[*] Final alignment pairs: {len(pairs)}")
