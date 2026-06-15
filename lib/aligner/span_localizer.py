@@ -1,10 +1,9 @@
 """
-Parent-window span localization for cross-lingual document pairs.
+Local-retrieval parent-window span localization for cross-lingual document pairs.
 
 After the document-level pipeline selects candidate (source, target) document
-pairs, this module finds, for each pair, the single continuous interval in the
-*parent* document whose Bimax score against the whole *child* document is
-highest.
+pairs, this module finds, for each pair, the continuous interval in the *parent*
+document that best matches the whole *child* document.
 
 This step intentionally does NOT do sentence alignment, monotonic alignment, or
 1:N / N:1 matching -- those are handled later by Vecalign. Here we only output
@@ -13,17 +12,23 @@ the best ``[start_chunk, end_chunk]`` window in the parent.
 Method per document pair:
   1. Two directional document-level Bimax scores decide which side is the child
      (the side more fully covered by the other) and which is the parent.
-  2. The child is kept whole.
-  3. Continuous candidate windows are generated in the parent, with lengths
-     scaled to the child length (parent may be longer due to translation,
-     annotation, or commentary).
-  4. Each window is scored with the existing Bimax (``aggregation="avg"``,
-     ``trim_ratio=1.0``): the mean of (child->window) and (window->child)
-     best-match coverages. ``max`` is used only inside each direction to find a
-     chunk's best counterpart; it is never used to pick the span.
-  5. A coarse-to-fine search (coarse scan with large stride over several window
-     lengths -> keep best candidates -> refine start/end) returns the highest
-     scoring window.
+  2. Local retrieval between the whole child and the current parent only: cosine
+     similarities ``child @ parent.T`` (no corpus-level index, no querying the
+     whole corpus and filtering by document).
+  3. For each child chunk, keep its top-k parent chunk hits.
+  4. Generate candidate parent windows whose ends are hit positions.
+  5. Rank candidate windows preliminarily by hit coverage (how many distinct
+     child chunks have a hit inside the window), keeping the top ones.
+  6. Score the kept windows with the symmetric mean Bimax
+     (``0.5 * (child->window + window->child)``, ``trim_ratio=1.0``) and pick the
+     highest -- ``max`` is used only inside each direction to find a chunk's best
+     counterpart, never to pick the span.
+  7. Pad the winning window by ``span_context_chunks`` on the parent side for
+     export (Vecalign); scores are never recomputed after padding.
+
+Local retrieval only proposes candidate positions; the two-directional Bimax mean
+is the only score used to choose the final window. No quantiles, clustering,
+RANSAC, Smith-Waterman, or DP.
 
 Chunk ranges are mapped to character offsets and raw text is exported as before.
 """
@@ -117,145 +122,130 @@ def _score_window(child_t, parent_t, start: int, end: int, normalize: bool) -> T
     return float(a), float(b)
 
 
-# =============================================================================
-# Window generation + coarse-to-fine search
-# =============================================================================
-
-def generate_window_lengths(
-    child_len: int,
-    parent_len: int,
-    multipliers: Sequence[float],
-) -> List[int]:
-    """
-    Candidate window lengths (in chunks), scaled to the child length and clipped
-    to [1, parent_len]. Deduplicated and sorted.
-    """
-    lengths = set()
-    for m in multipliers:
-        L = int(round(float(m) * child_len))
-        L = max(1, min(L, parent_len))
-        lengths.add(L)
-    return sorted(lengths)
-
-
-def _coarse_scan(
+def score_candidates(
     child_t,
     parent_t,
-    lengths: Sequence[int],
-    stride_ratio: float,
-    num_candidates: int,
+    candidates: Sequence[Tuple[int, int]],
     normalize: bool,
-) -> List[Tuple[float, int, int]]:
+) -> List[Tuple[float, int, int, float, float]]:
     """
-    Coarse scan: for each window length, slide a window with a large stride and
-    score it. Returns the top ``num_candidates`` as (score, start, end_exclusive).
+    Score each candidate window with the symmetric mean Bimax and sort descending.
+
+    Returns a list of (score, start, end_exclusive, child_to_window,
+    window_to_child); the first element is the best window.
     """
-    P = int(parent_t.shape[0])
-    cands: List[Tuple[float, int, int]] = []
-    seen = set()
-    for L in lengths:
-        stride = max(1, int(round(L * stride_ratio)))
-        starts = list(range(0, P - L + 1, stride))
-        if not starts:
-            starts = [0]
-        last = P - L
-        if last >= 0 and last not in starts:
-            starts.append(last)  # always include the trailing window
-        for s in starts:
-            e = s + L
-            if (s, e) in seen:
-                continue
-            seen.add((s, e))
-            a, b = _score_window(child_t, parent_t, s, e, normalize)
-            cands.append((0.5 * (a + b), s, e))
-    cands.sort(key=lambda x: x[0], reverse=True)
-    return cands[:num_candidates]
+    scored: List[Tuple[float, int, int, float, float]] = []
+    for s, e in candidates:
+        a, b = _score_window(child_t, parent_t, s, e, normalize)
+        scored.append((0.5 * (a + b), s, e, a, b))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
 
 
-def _refine(
+# =============================================================================
+# Local retrieval (child vs current parent only — no corpus index)
+# =============================================================================
+
+def local_retrieval_hits(
     child_t,
     parent_t,
-    candidates: Sequence[Tuple[float, int, int]],
-    radius: int,
-    min_window: int,
-    normalize: bool,
-) -> Optional[Tuple[float, int, int, float, float]]:
-    """
-    Fine search: around each coarse candidate, vary start and end by +/- radius
-    (stride 1) and re-score. Returns the global best as
-    (score, start, end_exclusive, child_to_window, window_to_child).
-    """
-    P = int(parent_t.shape[0])
-    best: Optional[Tuple[float, int, int, float, float]] = None
-    seen = set()
-    for _, s0, e0 in candidates:
-        for s in range(s0 - radius, s0 + radius + 1):
-            for e in range(e0 - radius, e0 + radius + 1):
-                if s < 0 or e > P or (e - s) < min_window:
-                    continue
-                if (s, e) in seen:
-                    continue
-                seen.add((s, e))
-                a, b = _score_window(child_t, parent_t, s, e, normalize)
-                score = 0.5 * (a + b)
-                if best is None or score > best[0]:
-                    best = (score, s, e, a, b)
-    return best
-
-
-def localize_best_window(
-    child_embs: np.ndarray,
-    parent_embs: np.ndarray,
     *,
-    window_multipliers: Sequence[float],
-    coarse_stride_ratio: float = 0.5,
-    num_candidates: int = 5,
-    refine_radius: int = 3,
-    min_window: int = 1,
-    normalize: bool = True,
-    device: str = "cpu",
-    verbose: bool = False,
-) -> Optional[Dict[str, Any]]:
+    top_k: int,
+    min_similarity: Optional[float],
+    normalize: bool,
+) -> List[Tuple[int, int, float]]:
     """
-    Find the continuous parent window maximizing Bimax(child, window) (avg).
+    For each child chunk, its top-k most similar parent chunks, computed directly
+    between this child and this parent (a single matmul; no FAISS, no corpus).
 
-    Returns a dict {start, end (exclusive), span_score, child_to_parent,
-    parent_to_child} or None when either document is empty.
+    Returns a list of (child_chunk_idx, parent_chunk_idx, similarity).
     """
     import torch
+    import torch.nn.functional as F
 
-    C = int(child_embs.shape[0]) if child_embs.ndim == 2 else 0
-    P = int(parent_embs.shape[0]) if parent_embs.ndim == 2 else 0
-    if C == 0 or P == 0:
-        return None
+    if child_t.shape[0] == 0 or parent_t.shape[0] == 0:
+        return []
 
-    child_t = torch.from_numpy(np.ascontiguousarray(child_embs)).float().to(device)
-    parent_t = torch.from_numpy(np.ascontiguousarray(parent_embs)).float().to(device)
+    C = F.normalize(child_t, p=2, dim=1) if normalize else child_t
+    P = F.normalize(parent_t, p=2, dim=1) if normalize else parent_t
 
-    lengths = generate_window_lengths(C, P, window_multipliers)
-    if not lengths:
-        return None
+    sims = C @ P.T  # [child_len, parent_len]
+    k = min(top_k, int(P.shape[0]))
+    vals, idx = torch.topk(sims, k, dim=1)
+    vals = vals.detach().cpu().numpy()
+    idx = idx.detach().cpu().numpy()
 
-    coarse = _coarse_scan(child_t, parent_t, lengths, coarse_stride_ratio, num_candidates, normalize)
-    if verbose:
-        print(f"    [window] child={C} parent={P} lengths={lengths} coarse_top={len(coarse)}")
-    if not coarse:
-        return None
+    hits: List[Tuple[int, int, float]] = []
+    for ci in range(idx.shape[0]):
+        for j in range(k):
+            sim = float(vals[ci, j])
+            if min_similarity is not None and sim < min_similarity:
+                continue
+            hits.append((ci, int(idx[ci, j]), sim))
+    return hits
 
-    best = _refine(child_t, parent_t, coarse, refine_radius, min_window, normalize)
-    if best is None:
-        return None
 
-    score, s, e, a, b = best
-    if verbose:
-        print(f"    [window] best=[{s}..{e - 1}] score={score:.4f} c2p={a:.3f} p2c={b:.3f}")
-    return {
-        "start": s,
-        "end": e,  # exclusive
-        "span_score": float(score),
-        "child_to_parent": float(a),
-        "parent_to_child": float(b),
-    }
+# =============================================================================
+# Candidate windows + hit-coverage ranking
+# =============================================================================
+
+def _window_coverage(pos_children: Dict[int, set], start: int, end: int) -> int:
+    """Distinct child chunks that have a hit at a parent position in [start, end)."""
+    seen: set = set()
+    for p, cs in pos_children.items():
+        if start <= p < end:
+            seen |= cs
+    return len(seen)
+
+
+def propose_and_rank_windows(
+    hits: Sequence[Tuple[int, int, float]],
+    parent_len: int,
+    *,
+    min_len: int,
+    max_len: int,
+    top_windows: int,
+) -> List[Tuple[int, int, int]]:
+    """
+    Generate candidate parent windows whose ends are hit positions, rank them by
+    hit coverage (distinct child chunks with a hit inside), and keep the best.
+
+    A sliding pair of hit positions (a, b) forms the window [a, b+1) when its
+    length is in [min_len, max_len]; coverage is accumulated incrementally as the
+    right end extends. Ties are broken toward the shorter window.
+
+    Returns up to ``top_windows`` items as (start, end_exclusive, coverage), best
+    coverage first.
+    """
+    pos_children: Dict[int, set] = defaultdict(set)
+    for ci, pp, _sim in hits:
+        pos_children[pp].add(ci)
+    pos = sorted(pos_children)
+    n = len(pos)
+
+    scored: List[Tuple[int, int, int, int]] = []  # (coverage, -length, start, end_excl)
+    for i in range(n):
+        a = pos[i]
+        seen: set = set()
+        for j in range(i, n):
+            length = pos[j] - a + 1
+            if length > max_len:
+                break  # sorted: further j only longer
+            seen |= pos_children[pos[j]]
+            if length >= min_len:
+                scored.append((len(seen), -length, a, pos[j] + 1))
+
+    if not scored:
+        # Guarantee at least one bounded window anchored on each hit position.
+        L = min(min_len, parent_len)
+        for a in pos:
+            s = max(0, min(a, parent_len - L))
+            e = s + L
+            if s < e:
+                scored.append((_window_coverage(pos_children, s, e), -(e - s), s, e))
+
+    scored.sort(reverse=True)
+    return [(s, e, cov) for (cov, _neg_len, s, e) in scored[:top_windows]]
 
 
 # =============================================================================
@@ -278,37 +268,59 @@ def _char_span(
         return -1, -1
 
 
+def _empty_debug() -> Dict[str, Any]:
+    return {
+        "child_side": "",
+        "hit_count": 0,
+        "child_coverage": 0.0,
+        "raw_min_chunk": -1,
+        "raw_max_chunk": -1,
+        "candidate_window_count": 0,
+        "best_coverage": -1,
+        "best_score_start_chunk": -1,
+        "best_score_end_chunk": -1,
+        "best_window_length": 0,
+        "reason": "",
+    }
+
+
 def localize_document_pair(
     src_embs: np.ndarray,
     tar_embs: np.ndarray,
     *,
     src_meta: Optional[Sequence[Dict[str, Any]]] = None,
     tar_meta: Optional[Sequence[Dict[str, Any]]] = None,
-    window_multipliers: Sequence[float] = (0.8, 1.0, 1.25, 1.5, 2.0),
-    coarse_stride_ratio: float = 0.5,
-    num_candidates: int = 5,
-    refine_radius: int = 3,
-    min_window: int = 1,
-    normalize: bool = True,
+    top_k_hits: int = 3,
+    hit_min_similarity: Optional[float] = None,
+    min_child_length_ratio: float = 0.8,
+    max_child_length_ratio: float = 3.0,
+    top_windows: int = 10,
     context_chunks: int = 1,
+    normalize: bool = True,
     device: str = "cpu",
     verbose: bool = False,
-) -> Optional[LocalizedSpan]:
+) -> Tuple[Optional[LocalizedSpan], Dict[str, Any]]:
     """
     Localize the best parent window for one (source, target) document pair.
 
     Directional document-level Bimax picks the child (more fully covered) and the
-    parent. The child is kept whole; the best continuous window in the parent is
-    found by coarse-to-fine Bimax search.
+    parent. Local retrieval (child vs this parent only) proposes parent positions;
+    candidate windows are formed from those positions, ranked by hit coverage, and
+    the kept windows are scored with symmetric mean Bimax. The parent side is
+    padded by ``context_chunks`` for export (scores untouched).
 
-    After the score window is determined, ``context_chunks`` chunks are added to
-    each side of the parent window to produce the export window (for Vecalign).
-    Scores are never recomputed after padding. The child side is never padded.
+    Returns ``(LocalizedSpan, debug)`` on success, or ``(None, debug)`` when the
+    pair is skipped (debug always carries a ``reason``).
     """
+    import torch
+
+    debug = _empty_debug()
+
     n_src = int(src_embs.shape[0]) if src_embs.ndim == 2 else 0
     n_tar = int(tar_embs.shape[0]) if tar_embs.ndim == 2 else 0
     if n_src == 0 or n_tar == 0:
-        return None
+        debug["reason"] = "empty_document"
+        return None, debug
 
     # 1. Directional document-level coverage -> child / parent.
     cover_src_by_tar, cover_tar_by_src = _directional_scores(
@@ -319,6 +331,13 @@ def localize_document_pair(
         child_embs, parent_embs, child_side = src_embs, tar_embs, "src"
     else:
         child_embs, parent_embs, child_side = tar_embs, src_embs, "tar"
+    debug["child_side"] = child_side
+
+    child_len = int(child_embs.shape[0])
+    parent_len = int(parent_embs.shape[0])
+
+    child_t = torch.from_numpy(np.ascontiguousarray(child_embs)).float().to(device)
+    parent_t = torch.from_numpy(np.ascontiguousarray(parent_embs)).float().to(device)
 
     if verbose:
         print(
@@ -326,34 +345,62 @@ def localize_document_pair(
             f"cover(tar|src)={cover_tar_by_src:.3f} -> child={child_side}"
         )
 
-    # 2/3/4. Best continuous window in the parent.
-    win = localize_best_window(
-        child_embs, parent_embs,
-        window_multipliers=window_multipliers,
-        coarse_stride_ratio=coarse_stride_ratio,
-        num_candidates=num_candidates,
-        refine_radius=refine_radius,
-        min_window=min_window,
-        normalize=normalize,
-        device=device,
-        verbose=verbose,
+    # 2/3. Local retrieval: top-k parent hits per child chunk.
+    hits = local_retrieval_hits(
+        child_t, parent_t, top_k=top_k_hits,
+        min_similarity=hit_min_similarity, normalize=normalize,
     )
-    if win is None:
-        return None
+    if not hits:
+        debug["reason"] = "no_hits"
+        return None, debug
 
-    child_len = int(child_embs.shape[0])
-    parent_len = int(parent_embs.shape[0])
-    win_start, win_end_excl = win["start"], win["end"]
+    positions = [p for (_, p, _) in hits]
+    distinct_children = len({c for (c, _, _) in hits})
+    debug["hit_count"] = len(hits)
+    debug["child_coverage"] = round(distinct_children / max(1, child_len), 4)
+    debug["raw_min_chunk"] = int(min(positions))
+    debug["raw_max_chunk"] = int(max(positions))
 
-    # 5a. Score span (raw Bimax winner, parent-local coordinates).
-    score_start = win_start
-    score_end_excl = win_end_excl
+    # 4/5/6. Candidate windows (length bounded to the child length) ranked by
+    #        hit coverage; keep the top ones.
+    min_len = max(1, int(round(child_len * min_child_length_ratio)))
+    max_len = int(round(child_len * max_child_length_ratio))
+    min_len = min(min_len, parent_len)
+    max_len = max(min_len, min(max_len, parent_len))
 
-    # 5b. Export span: pad score span on both ends (parent only; child stays whole).
+    top = propose_and_rank_windows(
+        hits, parent_len, min_len=min_len, max_len=max_len, top_windows=top_windows
+    )
+    debug["candidate_window_count"] = len(top)
+    if not top:
+        debug["reason"] = "no_valid_candidates"
+        return None, debug
+
+    # 7. Symmetric mean Bimax over the kept windows; pick the best.
+    cand_windows = [(s, e) for (s, e, _cov) in top]
+    scored = score_candidates(child_t, parent_t, cand_windows, normalize)
+    best_score, best_s, best_e, c2w, w2c = scored[0]
+
+    debug["best_coverage"] = next((cov for (s, e, cov) in top if s == best_s and e == best_e), -1)
+    debug["best_score_start_chunk"] = best_s
+    debug["best_score_end_chunk"] = best_e - 1
+    debug["best_window_length"] = best_e - best_s
+    debug["reason"] = "ok"
+
+    if verbose:
+        print(
+            f"    [window] child={child_len} parent={parent_len} hits={len(hits)} "
+            f"child_cov={distinct_children / max(1, child_len):.2f} "
+            f"cands={len(top)} len_bounds=[{min_len},{max_len}]"
+        )
+        for sc, s, e, a, b in scored[:5]:
+            print(f"      cand [{s}..{e - 1}] len={e - s} score={sc:.4f} c2p={a:.3f} p2c={b:.3f}")
+
+    # 8. Score span -> export span (pad parent only; child stays whole).
+    score_start, score_end_excl = best_s, best_e
     export_start = max(0, score_start - context_chunks)
     export_end = min(parent_len, score_end_excl + context_chunks)
 
-    # 5c. Remap to source/target chunk coordinates.
     if src_is_child:
         # src = child (whole), tar = parent
         src_score_s, src_score_e = 0, child_len - 1
@@ -370,7 +417,7 @@ def localize_document_pair(
     src_start_char, src_end_char = _char_span(src_meta, src_start_chunk, src_end_chunk)
     tar_start_char, tar_end_char = _char_span(tar_meta, tar_start_chunk, tar_end_chunk)
 
-    return LocalizedSpan(
+    span = LocalizedSpan(
         source_start_chunk=src_start_chunk,
         source_end_chunk=src_end_chunk,
         target_start_chunk=tar_start_chunk,
@@ -380,15 +427,16 @@ def localize_document_pair(
         tar_score_start_chunk=tar_score_s,
         tar_score_end_chunk=tar_score_e,
         span_context_chunks=context_chunks,
-        span_score=win["span_score"],
+        span_score=float(best_score),
         child_side=child_side,
-        child_to_parent=win["child_to_parent"],
-        parent_to_child=win["parent_to_child"],
+        child_to_parent=float(c2w),
+        parent_to_child=float(w2c),
         source_start_char=src_start_char,
         source_end_char=src_end_char,
         target_start_char=tar_start_char,
         target_end_char=tar_end_char,
     )
+    return span, debug
 
 
 # =============================================================================
@@ -406,10 +454,10 @@ def localize_spans_for_pairs(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     For each source document, localize the best parent window against its top
-    target candidates. No FAISS index is needed: Bimax is computed directly
-    between the candidate document embeddings.
+    target candidates.
 
-    Returns (rows, debug_records).
+    Retrieval is local per pair (child vs that parent only) -- no corpus FAISS
+    index is built. Returns (rows, debug_records).
     """
     from lib.utils import AlignerIO, get_filename_only
 
@@ -421,7 +469,6 @@ def localize_spans_for_pairs(
     verbose = getattr(args, "verbose", False)
     save_debug = getattr(args, "save_span_debug", False)
     device = getattr(args, "device", "cpu") or "cpu"
-    win_mult = getattr(args, "span_window_multipliers", (0.8, 1.0, 1.25, 1.5, 2.0))
 
     # Group candidate targets per source document, keep top-k by document score.
     by_src: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
@@ -441,7 +488,6 @@ def localize_spans_for_pairs(
             continue
 
         src_records = AlignerIO.get_chunk_metadata_by_idx(src_meta_df, src_cm_dir, s_idx) or None
-
         s_path = AlignerIO.get_path_by_idx(src_meta_df, s_idx)
         s_name = get_filename_only(s_path) if s_path else str(s_idx)
 
@@ -451,26 +497,33 @@ def localize_spans_for_pairs(
                 continue
 
             tar_records = AlignerIO.get_chunk_metadata_by_idx(trg_meta_df, trg_cm_dir, t_idx) or None
+            t_path = AlignerIO.get_path_by_idx(trg_meta_df, t_idx)
+            t_name = get_filename_only(t_path) if t_path else str(t_idx)
 
-            span = localize_document_pair(
+            span, fdbg = localize_document_pair(
                 src_embs, tar_embs,
                 src_meta=src_records,
                 tar_meta=tar_records,
-                window_multipliers=win_mult,
-                coarse_stride_ratio=args.span_coarse_stride,
-                num_candidates=args.span_num_candidates,
-                refine_radius=args.span_refine_radius,
-                min_window=args.span_min_window,
-                normalize=True,
+                top_k_hits=args.span_top_k_hits,
+                hit_min_similarity=args.span_hit_min_similarity,
+                min_child_length_ratio=args.span_min_child_length_ratio,
+                max_child_length_ratio=args.span_max_child_length_ratio,
+                top_windows=args.span_top_windows,
                 context_chunks=getattr(args, "span_context_chunks", 1),
+                normalize=True,
                 device=device,
                 verbose=verbose,
             )
-            if span is None:
-                continue
 
-            t_path = AlignerIO.get_path_by_idx(trg_meta_df, t_idx)
-            t_name = get_filename_only(t_path) if t_path else str(t_idx)
+            if span is None:
+                if verbose:
+                    print(f"    [skip] {s_name} -> {t_name}: {fdbg.get('reason')}")
+                if save_debug:
+                    debug.append({
+                        "src_doc": s_name, "tar_doc": t_name,
+                        "document_score": float(doc_score), **fdbg,
+                    })
+                continue
 
             rows.append({
                 # TSV columns
@@ -509,7 +562,6 @@ def localize_spans_for_pairs(
                     "src_doc": s_name,
                     "tar_doc": t_name,
                     "document_score": float(doc_score),
-                    "child_side": span.child_side,
                     "span_score": span.span_score,
                     "child_to_parent": span.child_to_parent,
                     "parent_to_child": span.parent_to_child,
@@ -524,6 +576,7 @@ def localize_spans_for_pairs(
                         "src_chars": [span.source_start_char, span.source_end_char],
                         "tar_chars": [span.target_start_char, span.target_end_char],
                     },
+                    **fdbg,
                 })
 
     print(f"[*] Localized spans for {n_localized} document pair(s).")
@@ -733,25 +786,23 @@ def build_span_parser():
                              "Default None: use all pairs from the alignment TSV (already bounded "
                              "by --top_k_pairs in the aligner step).")
 
-    # Window search hyperparameters
-    parser.add_argument("--span_window_multipliers", type=float, nargs="+",
-                        default=[0.8, 1.0, 1.25, 1.5, 2.0],
-                        help="Window lengths as multipliers of the child length "
-                             "(parent may be longer due to translation/commentary).")
-    parser.add_argument("--span_coarse_stride", type=float, default=0.5,
-                        help="Coarse scan stride as a fraction of the window length.")
-    parser.add_argument("--span_num_candidates", type=int, default=5,
-                        help="Number of best coarse windows kept for refinement.")
-    parser.add_argument("--span_refine_radius", type=int, default=3,
-                        help="Refine start/end by +/- this many chunks (stride 1).")
-    parser.add_argument("--span_min_window", type=int, default=1,
-                        help="Minimum window length in chunks.")
+    # Local retrieval + candidate windows
+    parser.add_argument("--span_top_k_hits", type=int, default=3,
+                        help="Top parent chunks kept per child chunk during local retrieval.")
+    parser.add_argument("--span_hit_min_similarity", type=float, default=None,
+                        help="Drop retrieval hits below this cosine similarity (default: no floor).")
+    parser.add_argument("--span_min_child_length_ratio", type=float, default=0.8,
+                        help="Minimum candidate window length as a fraction of the child length.")
+    parser.add_argument("--span_max_child_length_ratio", type=float, default=3.0,
+                        help="Maximum candidate window length as a fraction of the child length.")
+    parser.add_argument("--span_top_windows", type=int, default=10,
+                        help="Number of coverage-ranked candidate windows kept for Bimax scoring.")
     parser.add_argument("--span_context_chunks", type=int, default=1,
                         help="Chunks to pad on each side of the score window for the "
                              "export span passed to Vecalign. Scores are not recomputed "
                              "after padding. Set 0 to disable padding.")
     parser.add_argument("--device", type=str, default=None,
-                        help="torch device for Bimax (default: cuda if available else cpu).")
+                        help="torch device for retrieval/Bimax (default: cuda if available else cpu).")
 
     parser.add_argument("--save_span_debug", action="store_true",
                         help="Dump per-pair span debug info to span_debug_<config>.jsonl.")
