@@ -75,8 +75,8 @@ class AlignerIO:
     
     @staticmethod
     def get_embs_by_indices(
-        meta_df: pd.DataFrame, 
-        embeddings_dir: Union[str, Path], 
+        meta_df: pd.DataFrame,
+        embeddings_dir: Union[str, Path],
         indices: List[int]
     ) -> Dict[int, np.ndarray]:
         """
@@ -84,9 +84,9 @@ class AlignerIO:
         """
         embeddings_dir = Path(embeddings_dir)
         results = {}
-        
+
         unique_indices = list(set(indices))
-        
+
         valid_indices = meta_df.index.intersection(unique_indices)
         needed_meta = meta_df.loc[valid_indices]
 
@@ -96,8 +96,76 @@ class AlignerIO:
                 results[idx] = np.load(emb_file_path).astype('float32')
             else:
                 print(f"Warning: File {emb_file_path} not found.")
-        
+
         return results
+
+    # -----------------------
+    # Chunk metadata (one record per embedding row): char offsets into raw text
+    # -----------------------
+    @staticmethod
+    def save_chunk_metadata(
+        chunk_meta_dir: Union[str, Path],
+        file_name: str,
+        records: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Save chunk metadata records as a JSONL file (one record per line).
+
+        Returns the file name written (relative to ``chunk_meta_dir``).
+        """
+        chunk_meta_dir = Path(chunk_meta_dir)
+        chunk_meta_dir.mkdir(parents=True, exist_ok=True)
+        out_path = chunk_meta_dir / file_name
+        with open(out_path, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return file_name
+
+    @staticmethod
+    def load_chunk_metadata(
+        chunk_meta_dir: Union[str, Path],
+        file_name: str,
+    ) -> List[Dict[str, Any]]:
+        """Load chunk metadata records from a JSONL file. Returns [] if missing."""
+        path = Path(chunk_meta_dir) / file_name
+        if not path.exists():
+            return []
+        records: List[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return records
+
+    @staticmethod
+    def get_chunk_metadata_by_idx(
+        meta_df: pd.DataFrame,
+        chunk_meta_dir: Union[str, Path],
+        doc_idx: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Load chunk metadata for a document by its doc_idx, using the
+        ``chunk_meta_file`` column of the metadata frame. Returns [] when the
+        doc_idx, column, or file is missing.
+        """
+        try:
+            row = meta_df.loc[doc_idx]
+        except (KeyError, TypeError):
+            return []
+        file_name = row.get("chunk_meta_file") if hasattr(row, "get") else None
+        if not file_name or (isinstance(file_name, float) and pd.isna(file_name)):
+            return []
+        return AlignerIO.load_chunk_metadata(chunk_meta_dir, str(file_name))
+
+    @staticmethod
+    def load_document_text(file_path: Union[str, Path]) -> str:
+        """
+        Read a document's text exactly as the splitter does, so that chunk
+        char offsets line up. Universal-newline translation is applied by
+        ``read_text`` (matching doc_split), but the text is otherwise raw.
+        """
+        return Path(file_path).read_text(encoding="utf-8", errors="replace")
 
 
 # -----------------------

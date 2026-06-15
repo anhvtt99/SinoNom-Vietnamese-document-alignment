@@ -17,91 +17,164 @@ ScoreMode = Literal["csls", "margin1", "cosine"]
 class VotingParentRetriever:
     def __init__(self):
         self.index: Optional[faiss.Index] = None
-        self.chunk2doc: Optional[np.ndarray] = None
+        self.chunk2doc: Optional[np.ndarray] = None    # FAISS row -> target doc_idx
+        self.chunk2local: Optional[np.ndarray] = None  # FAISS row -> local chunk idx within its doc
         self.meta_df: Optional[pd.DataFrame] = None
         self.dim: int = 0
 
     def load_target_corpus(self, lang_path: Union[str, Path]):
         """
         Phase 1: Load the entire Target Corpus into RAM and build the FAISS Index.
-        
+
+        Builds two row->id maps:
+          - chunk2doc:   FAISS global chunk row -> target doc_idx
+          - chunk2local: FAISS global chunk row -> local chunk idx inside that doc
+
+        Lengths are derived from the actual embedding matrices (shape[0]) rather
+        than trusting metadata's ``n_chunks``, then validated against the index.
+
         Args:
             lang_path: Path to the target language folder.
         """
         lang_path = Path(lang_path)
         embeddings_dir = lang_path / "embeddings"
-        meta_dir = lang_path / "metadata" 
-        
+        meta_dir = lang_path / "metadata"
+
         # Load metadata containing document paths and chunk counts
         self.meta_df = AlignerIO.load_metadata(meta_dir)
-        
+
         all_chunks = []
-        chunk2doc_list = []
-        
+        chunk2doc_list: List[int] = []
+        chunk2local_list: List[int] = []
+
         for _, row in self.meta_df.iterrows():
             emb_file = embeddings_dir / row['emb_file']
             if not emb_file.exists():
                 print(f"[Warning] Missing file: {emb_file}")
                 continue
-                
+
             # Load the embedding matrix of the document. Shape: [n_chunks, dim]
             emb_matrix = AlignerIO.load_doc_embedding(embeddings_dir, row['emb_file'])
+            n_rows = int(emb_matrix.shape[0])
+            if n_rows == 0:
+                continue
+
             all_chunks.append(emb_matrix)
-            
-            # Create the mapping: Repeat the 'doc_idx' for the number of chunks it has.
-            # E.g., if doc 0 has 3 chunks, we append [0, 0, 0]
-            chunk2doc_list.extend([row['doc_idx']] * int(row['n_chunks']))
-            
+            doc_idx = int(row['doc_idx'])
+            chunk2doc_list.extend([doc_idx] * n_rows)      # [doc, doc, ...] (n_rows)
+            chunk2local_list.extend(range(n_rows))         # [0, 1, ..., n_rows-1]
+
+        if not all_chunks:
+            raise RuntimeError(f"No embeddings found under {embeddings_dir}")
+
         # Flatten the list of 2D matrices into a single massive 2D matrix
         X = np.vstack(all_chunks)
-        
-        # Convert the mapping list to a Numpy array for O(1) lookups later
+
         self.chunk2doc = np.array(chunk2doc_list, dtype=np.int64)
+        self.chunk2local = np.array(chunk2local_list, dtype=np.int64)
         self.dim = X.shape[1]
-        
+
+        # Validate that every mapping lines up with the FAISS matrix length.
+        if not (len(self.chunk2doc) == len(self.chunk2local) == X.shape[0]):
+            raise ValueError(
+                f"Chunk map length mismatch: chunk2doc={len(self.chunk2doc)}, "
+                f"chunk2local={len(self.chunk2local)}, X={X.shape[0]}"
+            )
+
         print(f"[*] Building FAISS IndexFlatIP for {X.shape[0]} chunks...")
-        
-        # Use Inner Product (IP) since vectors are already L2 Normalized (equivalent to Cosine Similarity)
+
+        # Inner Product (IP) on L2-normalized vectors == cosine similarity.
         self.index = faiss.IndexFlatIP(self.dim)
         self.index.add(X)
-        
+
+        if self.index.ntotal != X.shape[0]:
+            raise ValueError(
+                f"FAISS index size {self.index.ntotal} != matrix rows {X.shape[0]}"
+            )
+
         print(f"[+] Done! Index is ready. Total target documents: {len(self.meta_df)}")
 
     def retrieve(self, query_chunks: np.ndarray, top_k_chunks: int = 5, top_k_docs: int = 10) -> List[Tuple[int, int]]:
         """
         Phase 2 & 3: Multi-Query Search and Plurality Voting (Hit Count).
-        
+
+        Each source chunk contributes AT MOST ONE vote per target document, even
+        if several of its top-k neighbors fall in the same target doc. This stops
+        a single chunk from dominating the vote via repeated near-duplicates.
+
         Args:
             query_chunks: Matrix [num_chunks_in_source, dim] of the source document.
             top_k_chunks: Number of nearest neighbors to retrieve for EACH source chunk.
             top_k_docs: Number of top parent documents to return based on vote count.
-            
+
         Returns:
             A list of tuples: [(target_doc_idx, total_votes), ...]
         """
         if self.index is None:
             raise RuntimeError("Index not built. Call load_target_corpus() first.")
-            
+
+        if query_chunks.shape[0] == 0:
+            return []
+
         # FAISS strictly requires float32
         query_chunks = query_chunks.astype('float32')
-        
-        # 1. SEARCH: Query all source chunks simultaneously (Parallel Search)
-        # 'I' is the Indices matrix. Shape: [num_chunks_in_source, top_k_chunks]
-        # It contains the FAISS internal IDs of the most similar target chunks.
-        scores, I = self.index.search(query_chunks, k=top_k_chunks)
-        
-        # 2. FILTER & FLATTEN: Remove missing neighbors (-1) and flatten the matrix
-        valid_I = I[I != -1]
-        
-        # 3. MAP-BACK: Translate FAISS internal Chunk IDs to Parent Document IDs
-        # This uses Numpy Advanced Indexing to map thousands of IDs instantly
-        hit_docs = self.chunk2doc[valid_I]
-        
-        # 4. AGGREGATE (Hit Count): Count how many times each parent document was "hit"
-        vote_counter = Counter(hit_docs.tolist())
-        
-        # Return the most frequently hit documents
+
+        # SEARCH all source chunks simultaneously. I: [num_src_chunks, top_k_chunks]
+        _, I = self.index.search(query_chunks, k=top_k_chunks)
+
+        # Per source chunk, dedup target docs (vote once per doc), then aggregate.
+        vote_counter: Counter = Counter()
+        for row in I:
+            docs_in_row = {
+                int(self.chunk2doc[cid])
+                for cid in row
+                if cid != -1
+            }
+            vote_counter.update(docs_in_row)
+
         return vote_counter.most_common(top_k_docs)
+
+    def search_chunk_hits(
+        self,
+        query_chunks: np.ndarray,
+        top_k_chunks: int = 5,
+    ) -> List[dict]:
+        """
+        Forward chunk-level nearest-neighbor search for span localization.
+
+        Returns one hit per (source chunk, retained neighbor) with both the
+        global FAISS id and the resolved (target doc, local chunk) coordinates.
+
+        Returns:
+            List of dicts with keys:
+              source_chunk_idx, target_global_chunk_idx, target_doc_idx,
+              target_chunk_idx, faiss_rank, faiss_score
+        """
+        if self.index is None:
+            raise RuntimeError("Index not built. Call load_target_corpus() first.")
+
+        if query_chunks.shape[0] == 0:
+            return []
+
+        query_chunks = query_chunks.astype('float32')
+        scores, I = self.index.search(query_chunks, k=top_k_chunks)
+
+        hits: List[dict] = []
+        n_src, k = I.shape
+        for s in range(n_src):
+            for rank in range(k):
+                gid = int(I[s, rank])
+                if gid == -1:
+                    continue
+                hits.append({
+                    "source_chunk_idx": s,
+                    "target_global_chunk_idx": gid,
+                    "target_doc_idx": int(self.chunk2doc[gid]),
+                    "target_chunk_idx": int(self.chunk2local[gid]),
+                    "faiss_rank": rank,
+                    "faiss_score": float(scores[s, rank]),
+                })
+        return hits
 
     def get_doc_info(self, doc_idx: int) -> dict:
         """Utility function to retrieve metadata for a specific document index."""
@@ -113,20 +186,26 @@ def build_retrieval_matrix(
     source_lang_path: Union[str, Path],
     target_lang_path: Union[str, Path],
     top_k_chunks: int = 5,
-    top_k_docs: int = 10
+    top_k_docs: int = 10,
+    retriever: Optional[VotingParentRetriever] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Wrapper for the Retriever to process all documents in the corpus.
     Returns matrices matching the FAISS API format: (Scores/Votes, Indices).
+
+    Args:
+        retriever: Optional pre-built VotingParentRetriever already loaded with
+                   the target corpus. Reused to avoid rebuilding the FAISS index.
     """
     source_lang_path = Path(source_lang_path)
     source_meta_path = source_lang_path / "metadata"
     source_emb_dir = source_lang_path / "embeddings"
 
-    # Load target index
-    retriever = VotingParentRetriever()
-    retriever.load_target_corpus(target_lang_path)
-    
+    # Load target index (reuse a prebuilt retriever when provided)
+    if retriever is None:
+        retriever = VotingParentRetriever()
+        retriever.load_target_corpus(target_lang_path)
+
     # Find the maximum document index to set the matrix size.
     # Use max() + 1 to prevent errors if some doc_idx are missing in the middle.
     source_meta_df = AlignerIO.load_metadata(source_meta_path)
@@ -452,14 +531,26 @@ def compute_csls(
     y_all = np.concatenate([y_A, y_B])
     scores_all = np.concatenate([scores_A, scores_B])
 
-    # --- STEP 5: Remove duplicate pairs ---
-    # Create a unique ID for each (x, y) pair to easily find duplicates
+    # --- STEP 5: Collapse duplicate pairs, keeping the MAX directional score ---
+    # The same (x, y) pair can appear from both directions (A->B and B->A) with
+    # different base scores. Taking the max (instead of np.unique's first-seen)
+    # uses the strongest directional evidence before applying CSLS.
     pair_keys = x_all * N_B + y_all
-    _, unique_indices = np.unique(pair_keys, return_index=True)
+    pair_df = pd.DataFrame({
+        "key": pair_keys,
+        "x": x_all,
+        "y": y_all,
+        "score": scores_all,
+    })
+    agg = (
+        pair_df.groupby("key", sort=False)
+        .agg(x=("x", "first"), y=("y", "first"), score=("score", "max"))
+        .reset_index(drop=True)
+    )
 
-    x_uniq = x_all[unique_indices]
-    y_uniq = y_all[unique_indices]
-    base_scores = scores_all[unique_indices]
+    x_uniq = agg["x"].to_numpy()
+    y_uniq = agg["y"].to_numpy()
+    base_scores = agg["score"].to_numpy()
 
     # --- STEP 6: Apply the CSLS Formula ---
     # Penalize "Hub" documents that are too close to everything

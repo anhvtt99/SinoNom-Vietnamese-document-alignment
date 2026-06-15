@@ -140,6 +140,7 @@ def _encode_and_save_feature_group(
     group_meta: Sequence[Dict],
     model: SentenceTransformer,
     embeddings_dir: Path,
+    chunk_meta_dir: Path,
     doc2idx_data: list,
     batch_size: int,
     normalize_embeddings: bool,
@@ -166,6 +167,7 @@ def _encode_and_save_feature_group(
         n_chunks = meta["n_chunks"]
         doc = meta["doc"]
         doc_idx = meta["doc_idx"]
+        records = meta["records"]
 
         emb_doc = emb_all[start:start + n_chunks]
         start += n_chunks
@@ -175,11 +177,20 @@ def _encode_and_save_feature_group(
 
         np.save(embeddings_dir / emb_file_name, emb_doc)
 
+        # One chunk metadata record per embedding row.
+        assert len(records) == emb_doc.shape[0], (
+            f"Chunk metadata mismatch for {doc}: {len(records)} records "
+            f"vs {emb_doc.shape[0]} embedding rows"
+        )
+        meta_file_name = f"{original_stem}.jsonl"
+        AlignerIO.save_chunk_metadata(chunk_meta_dir, meta_file_name, records)
+
         doc2idx_data.append({
             "doc_idx": doc_idx,
             "file_path": str(doc),
             "emb_file": emb_file_name,
             "n_chunks": emb_doc.shape[0],
+            "chunk_meta_file": meta_file_name,
         })
 
     assert start == emb_all.shape[0], (
@@ -225,20 +236,22 @@ def _process_per_doc(
     lang_path = Path(embeddings_output) / config_tag / lang
     embeddings_dir = lang_path / "embeddings"
     meta_dir = lang_path / "metadata"
-    
+    chunk_meta_dir = lang_path / "chunk_metadata"
+
     embeddings_dir.mkdir(parents=True, exist_ok=True)
     meta_dir.mkdir(parents=True, exist_ok=True)
-    
+    chunk_meta_dir.mkdir(parents=True, exist_ok=True)
+
     doc2idx_data = []
-    
+
     print(f"[{config_tag}] Processing {len(docs)} documents for lang: {lang}...")
     for idx, (doc) in enumerate(docs):
-        # get split
+        # get split (with one metadata record per embedding row)
         if split_mode == "sentence":
-            features = sent_split_tkn(doc, tok, lang, max_len=max_sent_len, max_tokens=max_tokens, num_of_sent=num_of_sent, overlap_sent=overlap_sent)
+            features, records = sent_split_tkn(doc, tok, lang, max_len=max_sent_len, max_tokens=max_tokens, num_of_sent=num_of_sent, overlap_sent=overlap_sent, return_metadata=True)
         else:
             overlap_size = int(chunk_size * overlap_rate)
-            features = chunk_split(doc, tok, chunk_size, overlap_size, max_tokens=max_tokens)
+            features, records = chunk_split(doc, tok, chunk_size, overlap_size, max_tokens=max_tokens, return_metadata=True)
 
         emb_doc = st_encode_features(
             model,
@@ -251,11 +264,20 @@ def _process_per_doc(
         emb_file_name = f"{original_stem}.npy"
         np.save(embeddings_dir / emb_file_name, emb_doc)
 
+        # One chunk metadata record per embedding row.
+        assert len(records) == emb_doc.shape[0], (
+            f"Chunk metadata mismatch for {doc}: {len(records)} records "
+            f"vs {emb_doc.shape[0]} embedding rows"
+        )
+        meta_file_name = f"{original_stem}.jsonl"
+        AlignerIO.save_chunk_metadata(chunk_meta_dir, meta_file_name, records)
+
         doc2idx_data.append({
             "doc_idx": idx,
             "file_path": str(doc),
             "emb_file": emb_file_name,
-            "n_chunks": emb_doc.shape[0]
+            "n_chunks": emb_doc.shape[0],
+            "chunk_meta_file": meta_file_name,
         })
     # Save doc2idx.tsv
     AlignerIO.save_metadata(meta_dir, doc2idx_data)
@@ -340,9 +362,11 @@ def _process_per_batch(
     lang_path = Path(embeddings_output) / config_tag / lang
     embeddings_dir = lang_path / "embeddings"
     meta_dir = lang_path / "metadata"
+    chunk_meta_dir = lang_path / "chunk_metadata"
 
     embeddings_dir.mkdir(parents=True, exist_ok=True)
     meta_dir.mkdir(parents=True, exist_ok=True)
+    chunk_meta_dir.mkdir(parents=True, exist_ok=True)
 
     doc2idx_data = []
 
@@ -357,7 +381,7 @@ def _process_per_batch(
 
     for idx, doc in enumerate(docs):
         if split_mode == "sentence":
-            features = sent_split_tkn(
+            features, records = sent_split_tkn(
                 doc,
                 tok,
                 lang,
@@ -365,15 +389,17 @@ def _process_per_batch(
                 max_tokens=max_tokens,
                 num_of_sent=num_of_sent,
                 overlap_sent=overlap_sent,
+                return_metadata=True,
             )
         else:
             overlap_size = int(chunk_size * overlap_rate)
-            features = chunk_split(
+            features, records = chunk_split(
                 doc,
                 tok,
                 chunk_size,
                 overlap_size,
                 max_tokens=max_tokens,
+                return_metadata=True,
             )
 
         n_chunks = int(features["input_ids"].shape[0])
@@ -386,11 +412,16 @@ def _process_per_batch(
                 np.empty((0, dim), dtype=np.float32),
             )
 
+            # Still write an (empty) metadata file so every doc has one.
+            meta_file_name = f"{doc.stem}.jsonl"
+            AlignerIO.save_chunk_metadata(chunk_meta_dir, meta_file_name, [])
+
             doc2idx_data.append({
                 "doc_idx": idx,
                 "file_path": str(doc),
                 "emb_file": emb_file_name,
                 "n_chunks": 0,
+                "chunk_meta_file": meta_file_name,
             })
             continue
 
@@ -399,6 +430,7 @@ def _process_per_batch(
             "doc_idx": idx,
             "doc": doc,
             "n_chunks": n_chunks,
+            "records": records,
         })
         group_n_chunks += n_chunks
 
@@ -413,6 +445,7 @@ def _process_per_batch(
                 group_meta=group_meta,
                 model=model,
                 embeddings_dir=embeddings_dir,
+                chunk_meta_dir=chunk_meta_dir,
                 doc2idx_data=doc2idx_data,
                 batch_size=batch_size,
                 normalize_embeddings=normalize_embeddings,
@@ -434,6 +467,7 @@ def _process_per_batch(
             group_meta=group_meta,
             model=model,
             embeddings_dir=embeddings_dir,
+            chunk_meta_dir=chunk_meta_dir,
             doc2idx_data=doc2idx_data,
             batch_size=batch_size,
             normalize_embeddings=normalize_embeddings,
