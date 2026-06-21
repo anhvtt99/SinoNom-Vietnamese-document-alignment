@@ -1,4 +1,5 @@
 import argparse
+import warnings
 from pathlib import Path
 from typing import Optional, Sequence, Union, Literal, Dict
 
@@ -231,14 +232,23 @@ def _process_per_doc(
     if split_mode ==  "chunk" and (overlap_rate < 0 or overlap_rate >= 1):
         raise ValueError("overlap_rate is invalid for chunk split")  
 
+    tok = model.tokenizer
+    model_max_len = model.max_seq_length  # model's hard sequence-length limit (auto)
+
+    if split_mode == "chunk" and chunk_size > model_max_len - 2:
+        effective = model_max_len - 2
+        warnings.warn(
+            f"chunk_size={chunk_size} exceeds model max_seq_length-2={model_max_len - 2}; "
+            f"clamping to {effective}. config.json and output directory will reflect the "
+            f"effective value.",
+            stacklevel=2,
+        )
+        chunk_size = effective
+
     if split_mode == "sentence":
         config_tag = f'{split_mode}_n{num_of_sent}_o{overlap_sent}'
     else:
         config_tag = f'{split_mode}_s{chunk_size}_r{overlap_rate}'
-
-    tok = model.tokenizer
-    model_max_len = model.max_seq_length  # model's hard sequence-length limit (auto)
-
 
     # Setup Path
     print(f"[{config_tag}] Constructing embedding output file system...")
@@ -358,13 +368,23 @@ def _process_per_batch(
     if split_mode == "chunk" and (overlap_rate < 0 or overlap_rate >= 1):
         raise ValueError("overlap_rate is invalid for chunk split")
 
+    tok = model.tokenizer
+    model_max_len = model.max_seq_length  # model's hard sequence-length limit (auto)
+
+    if split_mode == "chunk" and chunk_size > model_max_len - 2:
+        effective = model_max_len - 2
+        warnings.warn(
+            f"chunk_size={chunk_size} exceeds model max_seq_length-2={model_max_len - 2}; "
+            f"clamping to {effective}. config.json and output directory will reflect the "
+            f"effective value.",
+            stacklevel=2,
+        )
+        chunk_size = effective
+
     if split_mode == "sentence":
         config_tag = f"{split_mode}_n{num_of_sent}_o{overlap_sent}"
     else:
         config_tag = f"{split_mode}_s{chunk_size}_r{overlap_rate}"
-
-    tok = model.tokenizer
-    model_max_len = model.max_seq_length  # model's hard sequence-length limit (auto)
 
     print(f"[{config_tag}] Constructing embedding output file system...")
     lang_path = Path(embeddings_output) / config_tag / lang

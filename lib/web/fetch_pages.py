@@ -11,6 +11,7 @@ Supported content:
     - HTML: trafilatura first, BeautifulSoup fallback
     - text/plain: direct response text
     - PDF: PyMuPDF
+    - DOCX (Word / OOXML): zip + word/document.xml (stdlib)
 
 Async:
     Uses aiohttp with a configurable semaphore (--max_concurrent) so
@@ -35,12 +36,17 @@ Required packages:
 import argparse
 import asyncio
 import hashlib
+import io
 import json
 import re
+import statistics
+import zipfile
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
+from xml.etree import ElementTree as ET
 
 import aiohttp
 import fitz  # PyMuPDF
@@ -138,7 +144,7 @@ def content_stem(
         s = re.sub(r"[\s_]+", "_", s).strip("_. ")
         return s[:max_len].strip("_. ") or "untitled"
 
-    if content_kind == "pdf":
+    if content_kind in ("pdf", "docx"):
         # e.g. https://example.com/docs/vhtt2023.pdf  →  vhtt2023
         path_part = urlparse(url).path.rstrip("/")
         name = Path(path_part).stem if path_part else ""
@@ -286,6 +292,9 @@ def detect_content_kind(url: str, content_type: str, content_bytes: bytes) -> st
     if "application/pdf" in lower_type or lower_url.endswith(".pdf"):
         return "pdf"
 
+    if "wordprocessingml.document" in lower_type or lower_url.endswith(".docx"):
+        return "docx"
+
     if "text/plain" in lower_type or lower_url.endswith(".txt"):
         return "text"
 
@@ -296,6 +305,12 @@ def detect_content_kind(url: str, content_type: str, content_bytes: bytes) -> st
 
     if head.startswith(b"%pdf"):
         return "pdf"
+
+    # OOXML container (.docx/.xlsx/.pptx) is a ZIP starting with PK\x03\x04.
+    # Treat it as docx; the extractor confirms a Word document and returns
+    # empty for non-Word OOXML (xlsx/pptx), which is then dropped downstream.
+    if content_bytes[:4] == b"PK\x03\x04":
+        return "docx"
 
     if b"<html" in head or b"<!doctype html" in head:
         return "html"
@@ -393,39 +408,252 @@ def extract_html_content(
     }
 
 
+# Layout-aware PDF extraction is the default; it can be turned off globally by
+# flipping this flag (extract_pdf_content then falls back to plain get_text).
+PDF_LAYOUT_CLEAN = True
+
+_ROMAN_RE = re.compile(r"^[ivxlcdm]+$")
+_PDF_NUM_RE = re.compile(r"^\s*\d{1,4}\s*$")
+_PDF_TERM_RE = re.compile(r"[.!?:;…”’\"')\]]\s*$")
+
+
+def _norm_running(text: str) -> str:
+    """Letter-only fingerprint of a block (digits/roman/punct dropped) for
+    detecting running headers/footers that repeat across pages."""
+    toks = re.findall(r"[^\W\d_]+", text.lower(), flags=re.UNICODE)
+    toks = [t for t in toks if not _ROMAN_RE.match(t)]
+    return " ".join(toks)
+
+
+def _join_block_lines(lines: List[str], col_width: int, fill: float = 0.75) -> str:
+    """
+    Reflow the lines of one block: a line that nearly fills the page column is a
+    soft wrap (joined to the next); a clearly shorter line is a deliberate break
+    (verse line, list item, paragraph end) and is kept. Width is measured against
+    the page column (not the block) so verse-only blocks are preserved too.
+    """
+    L = [x.strip() for x in lines if x.strip()]
+    if not L:
+        return ""
+    out: List[str] = []
+    buf = ""
+    for x in L:
+        buf = (buf + " " + x) if buf else x
+        if len(x) < fill * col_width:
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return "\n".join(out)
+
+
+def _pdf_layout_text(
+    doc,
+    *,
+    footnote_min_frac: float = 0.02,
+    header_band: float = 0.12,
+    font_map: Dict[str, str] = None,
+) -> str:
+    """
+    Layout-aware text from a PDF, using block coordinates + font sizes:
+      - strip running headers/footers (text repeating in the top/bottom band)
+      - strip page-number blocks (pure numeric) and small-font blocks (footnotes)
+      - reflow soft wraps within a block (joining lines that fill the page column)
+        while keeping deliberate short lines such as verse
+      - rejoin paragraphs split across page breaks
+    """
+    page_blocks: List[List[Dict[str, Any]]] = []
+    size_chars: Counter = Counter()
+
+    for page in doc:
+        h = float(page.rect.height) or 1.0
+        raw: List[Dict[str, Any]] = []
+        for b in page.get_text("dict").get("blocks", []):
+            if b.get("type", 0) != 0:
+                continue
+            lines: List[str] = []
+            sizes: List[float] = []
+            for ln in b.get("lines", []):
+                spans = ln.get("spans", [])
+                line_text = "".join(s.get("text", "") for s in spans)
+                if line_text.strip():
+                    lines.append(line_text.rstrip())
+                for s in spans:
+                    n = len(s.get("text", ""))
+                    if n:
+                        sz = round(float(s.get("size", 0.0)), 1)
+                        sizes.append(sz)
+                        size_chars[sz] += n
+            if not lines:
+                continue
+            y0 = float(b["bbox"][1])
+            raw.append({
+                "y0": y0,
+                "ynorm": y0 / h,
+                "lines": lines,
+                "size": statistics.median(sizes) if sizes else 0.0,
+            })
+        # Page column width (chars) = longest body line on the page. Lines that
+        # nearly reach it are soft wraps to join; shorter lines are kept as-is.
+        col_width = max((len(x) for bk in raw for x in bk["lines"]), default=80)
+        page_blocks.append([
+            {
+                "y0": bk["y0"],
+                "ynorm": bk["ynorm"],
+                "size": bk["size"],
+                "text": _join_block_lines(bk["lines"], col_width),
+            }
+            for bk in raw
+        ])
+
+    body_size = max(size_chars, key=size_chars.get) if size_chars else 0.0
+    # Footnote/fine-print cutoff, auto-derived from the font-size histogram:
+    # body = dominant size; the largest *significant* smaller cluster (>= a few
+    # percent of characters) is the footnote size; cut halfway between them. If
+    # no such smaller cluster exists (uniform font) we do not size-strip at all.
+    total_chars = sum(size_chars.values()) or 1
+    smaller = [s for s, c in size_chars.items()
+               if s < body_size and c >= footnote_min_frac * total_chars]
+    footnote_cutoff = (body_size + max(smaller)) / 2.0 if smaller else 0.0
+    npages = max(1, len(page_blocks))
+
+    # running header/footer = block fingerprint that recurs in the top/bottom band
+    run_count: Counter = Counter()
+    for blocks in page_blocks:
+        keys = set()
+        for b in blocks:
+            if b["ynorm"] < header_band or b["ynorm"] > 1 - header_band:
+                k = _norm_running(b["text"])
+                if k:
+                    keys.add(k)
+        for k in keys:
+            run_count[k] += 1
+    running = {k for k, c in run_count.items() if c >= max(3, int(0.4 * npages))}
+
+    out: List[str] = []
+    pending = ""
+    for blocks in page_blocks:
+        kept: List[str] = []
+        for b in sorted(blocks, key=lambda x: x["y0"]):
+            t = b["text"]
+            if _PDF_NUM_RE.match(t.strip()):
+                continue
+            in_band = b["ynorm"] < header_band or b["ynorm"] > 1 - header_band
+            if in_band and _norm_running(t) in running:
+                continue
+            if footnote_cutoff and b["size"] and b["size"] < footnote_cutoff:
+                continue
+            if font_map:
+                for broken, correct in font_map.items():
+                    t = t.replace(broken, correct)
+            kept.append(t)
+
+        if pending and kept:
+            kept[0] = pending + " " + kept[0]
+            pending = ""
+
+        if kept:
+            last_line = kept[-1].splitlines()[-1] if kept[-1].strip() else ""
+            if last_line and not _PDF_TERM_RE.search(last_line):
+                pending = kept.pop()
+
+        out.extend(kept)
+
+    if pending:
+        out.append(pending)
+
+    return "\n\n".join(out).strip()
+
+
 def extract_pdf_content(
     pdf_bytes: bytes,
     min_text_len: int = DEFAULT_MIN_TEXT_LEN,
     collect_assets: bool = False,
+    layout_clean: bool = None,
+    font_map: Dict[str, str] = None,
 ) -> Dict[str, Any]:
+    if layout_clean is None:
+        layout_clean = PDF_LAYOUT_CLEAN
+
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-    pages = []
-    assets = []
+    assets = (
+        [{"type": "pdf_page", "page_num": i + 1, "needs_ocr": True} for i in range(len(doc))]
+        if collect_assets else []
+    )
 
-    for page_idx, page in enumerate(doc, start=1):
-        text = page.get_text("text")
-        if text:
-            pages.append(text.strip())
+    extractor = "pymupdf"
+    text = ""
+    if layout_clean:
+        try:
+            text = _pdf_layout_text(doc, font_map=font_map)
+            if text:
+                extractor = "pymupdf_layout"
+        except Exception:
+            text = ""  # fall back to plain extraction below
 
-        # Future OCR hook: record page assets without rendering images yet.
-        if collect_assets:
-            assets.append({
-                "type": "pdf_page",
-                "page_num": page_idx,
-                "needs_ocr": True,
-            })
+    if not text:
+        pages = [p.get_text("text").strip() for p in doc]
+        text = "\n\n".join(t for t in pages if t).strip()
 
-    text = "\n\n".join(pages).strip()
     needs_ocr = len(text) < min_text_len
 
     return {
         "text": text,
         "text_len": len(text),
-        "extractor": "pymupdf",
+        "extractor": extractor,
         "html_title": "",
         "needs_ocr": needs_ocr,
         "assets": assets if needs_ocr else [],
+    }
+
+
+def extract_docx_content(
+    docx_bytes: bytes,
+    min_text_len: int = DEFAULT_MIN_TEXT_LEN,
+) -> Dict[str, Any]:
+    """
+    Extract text from a Word .docx (OOXML) file.
+
+    A .docx is a ZIP whose main text lives in ``word/document.xml``. We take the
+    text of every paragraph (``w:p``) by concatenating its runs (``w:t``); this
+    also captures table cells, which are paragraphs nested inside ``w:tbl``.
+
+    Non-Word OOXML (xlsx/pptx) has no ``word/document.xml`` and yields empty text.
+    """
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    empty = {
+        "text": "", "text_len": 0, "extractor": "docx",
+        "html_title": "", "needs_ocr": False, "assets": [],
+    }
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(docx_bytes))
+    except zipfile.BadZipFile:
+        return empty
+
+    if "word/document.xml" not in zf.namelist():
+        return empty  # not a Word document (e.g. xlsx/pptx)
+
+    try:
+        root = ET.fromstring(zf.read("word/document.xml"))
+    except ET.ParseError:
+        return empty
+
+    paras: List[str] = []
+    for p in root.iter(f"{W}p"):
+        line = "".join(t.text for t in p.iter(f"{W}t") if t.text).strip()
+        if line:
+            paras.append(line)
+
+    text = "\n".join(paras).strip()
+    return {
+        "text": text,
+        "text_len": len(text),
+        "extractor": "docx",
+        "html_title": "",
+        "needs_ocr": False,
+        "assets": [],
     }
 
 
@@ -456,6 +684,11 @@ def _extract_and_save(
             min_text_len=min_text_len,
             collect_assets=collect_assets,
         )
+    elif content_kind == "docx":
+        extracted = extract_docx_content(
+            docx_bytes=content_bytes,
+            min_text_len=min_text_len,
+        )
     else:
         decoded = content_bytes.decode(charset, errors="replace")
         if content_kind == "text":
@@ -479,11 +712,11 @@ def _extract_and_save(
         (content_dir / f"{stem}.txt").write_text(text, encoding="utf-8")
         text_file = f"{CONTENT_SUBDIR}/{stem}.txt"
 
-    # PDF: also keep the raw file for future OCR / re-extraction.
-    if content_kind == "pdf":
+    # PDF / DOCX: also keep the raw file for future OCR / re-extraction.
+    if content_kind in ("pdf", "docx"):
         content_dir.mkdir(parents=True, exist_ok=True)
-        (content_dir / f"{stem}.pdf").write_bytes(content_bytes)
-        raw_file = f"{CONTENT_SUBDIR}/{stem}.pdf"
+        (content_dir / f"{stem}.{content_kind}").write_bytes(content_bytes)
+        raw_file = f"{CONTENT_SUBDIR}/{stem}.{content_kind}"
 
     return {
         "extractor": extracted.get("extractor", ""),

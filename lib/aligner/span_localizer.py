@@ -33,6 +33,7 @@ RANSAC, Smith-Waterman, or DP.
 Chunk ranges are mapped to character offsets and raw text is exported as before.
 """
 
+import statistics
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -198,6 +199,52 @@ def _window_coverage(pos_children: Dict[int, set], start: int, end: int) -> int:
     return len(seen)
 
 
+def _trim_window_bounds(
+    child_t,
+    parent_t,
+    start: int,
+    end: int,  # exclusive
+    *,
+    normalize: bool,
+    min_sim: float,
+    min_len: int,
+) -> Tuple[int, int]:
+    """
+    Trim parent chunks at the window boundaries whose best match in the child
+    embedding is below ``min_sim``.
+
+    Directly reduces the p2c < c2p asymmetry by stripping non-matching
+    prefix/suffix chunks from the selected window without re-running the full
+    candidate proposal. Returns the original ``(start, end)`` unchanged when the
+    result would be shorter than ``min_len`` or when no chunks qualify.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if end - start <= min_len:
+        return start, end
+
+    C = F.normalize(child_t, p=2, dim=1) if normalize else child_t
+    P = F.normalize(parent_t[start:end], p=2, dim=1) if normalize else parent_t[start:end]
+    per_parent = (P @ C.T).max(dim=1).values.detach().cpu().numpy()
+
+    new_start = start
+    for i, sim in enumerate(per_parent):
+        if sim >= min_sim:
+            break
+        new_start = start + i + 1
+
+    new_end = end
+    for i in range(len(per_parent) - 1, -1, -1):
+        if per_parent[i] >= min_sim:
+            break
+        new_end = start + i
+
+    if new_end - new_start < min_len:
+        return start, end
+    return new_start, new_end
+
+
 def propose_and_rank_windows(
     hits: Sequence[Tuple[int, int, float]],
     parent_len: int,
@@ -210,9 +257,11 @@ def propose_and_rank_windows(
     Generate candidate parent windows whose ends are hit positions, rank them by
     hit coverage (distinct child chunks with a hit inside), and keep the best.
 
-    A sliding pair of hit positions (a, b) forms the window [a, b+1) when its
-    length is in [min_len, max_len]; coverage is accumulated incrementally as the
-    right end extends. Ties are broken toward the shorter window.
+    Ranking is coverage-first (then shorter) so the kept set is biased toward the
+    windows that cover the most of the child -- the downstream selector picks the
+    highest-coverage window so the span reaches the full extent of the child's
+    content (completeness over tightness). Length is bounded by ``max_len``, which
+    caps how far an outlier hit can stretch the window.
 
     Returns up to ``top_windows`` items as (start, end_exclusive, coverage), best
     coverage first.
@@ -230,13 +279,12 @@ def propose_and_rank_windows(
         for j in range(i, n):
             length = pos[j] - a + 1
             if length > max_len:
-                break  # sorted: further j only longer
+                break
             seen |= pos_children[pos[j]]
             if length >= min_len:
                 scored.append((len(seen), -length, a, pos[j] + 1))
 
     if not scored:
-        # Guarantee at least one bounded window anchored on each hit position.
         L = min(min_len, parent_len)
         for a in pos:
             s = max(0, min(a, parent_len - L))
@@ -246,6 +294,227 @@ def propose_and_rank_windows(
 
     scored.sort(reverse=True)
     return [(s, e, cov) for (cov, _neg_len, s, e) in scored[:top_windows]]
+
+
+def _lis_nondecreasing(vals: Sequence[int]) -> List[int]:
+    """Indices of a longest non-decreasing subsequence of ``vals`` (O(n log n))."""
+    import bisect
+    tails_idx: List[int] = []
+    prev = [-1] * len(vals)
+    tail_vals: List[int] = []
+    for i, v in enumerate(vals):
+        j = bisect.bisect_right(tail_vals, v)
+        prev[i] = tails_idx[j - 1] if j > 0 else -1
+        if j == len(tails_idx):
+            tails_idx.append(i)
+            tail_vals.append(v)
+        else:
+            tails_idx[j] = i
+            tail_vals[j] = v
+    out: List[int] = []
+    k = tails_idx[-1] if tails_idx else -1
+    while k != -1:
+        out.append(k)
+        k = prev[k]
+    return out[::-1]
+
+
+def _diagonal_bounds(
+    hits: Sequence[Tuple[int, int, float]],
+    best_s: int,
+    best_e: int,  # exclusive
+    child_len: int,
+    *,
+    cap_ratio: float,
+) -> Tuple[float, float]:
+    """
+    Estimate how far the parent window *should* reach on each side from the
+    child->parent diagonal, to bound how much the similarity gate may grow it.
+
+    Builds one best-similarity anchor per child chunk inside ``[best_s, best_e)``,
+    drops backward outliers with a non-decreasing-by-position filter (the monotonic
+    cluster), then fits a *local* slope at each cluster end (over ~1/3 of the chain,
+    so a single bad endpoint cannot tilt it) and extrapolates to child 0 and
+    child_len-1. A per-end local slope matters because a document's head and tail
+    can expand at different rates than its bulk.
+
+    Returns ``(est_start, est_end_inclusive)`` as floats, each capped at
+    ``cap_ratio × window_length`` beyond the input window. Falls back to the window
+    bounds when there is not enough monotonic signal (< 2 chain anchors).
+    """
+    best: Dict[int, Tuple[int, float]] = {}
+    for ci, pj, sim in hits:
+        if best_s <= pj < best_e and (ci not in best or sim > best[ci][1]):
+            best[ci] = (pj, sim)
+    if len(best) < 2:
+        return float(best_s), float(best_e - 1)
+
+    anchors = sorted((ci, pj) for ci, (pj, _sim) in best.items())
+    childs = [a[0] for a in anchors]
+    poss = [a[1] for a in anchors]
+
+    keep = _lis_nondecreasing(poss)
+    if len(keep) < 2:
+        return float(best_s), float(best_e - 1)
+    childs = [childs[i] for i in keep]
+    poss = [poss[i] for i in keep]
+
+    m = min(len(childs), max(2, len(childs) // 3))
+
+    def _slope(xs: List[int], ys: List[int]) -> float:
+        if len(xs) < 2 or xs[-1] == xs[0]:
+            return 1.3  # neutral expansion fallback
+        a = float(np.polyfit(xs, ys, 1)[0])
+        return min(3.0, max(0.5, a))
+
+    s_start = _slope(childs[:m], poss[:m])
+    s_end = _slope(childs[-m:], poss[-m:])
+    c_start = statistics.median(childs[:m]); p_start = statistics.median(poss[:m])
+    c_end = statistics.median(childs[-m:]); p_end = statistics.median(poss[-m:])
+
+    win = best_e - best_s
+    est_start = max(p_start - s_start * c_start, best_s - cap_ratio * win)
+    est_end = min(p_end + s_end * (child_len - 1 - c_end), (best_e - 1) + cap_ratio * win)
+    return min(est_start, float(best_s)), max(est_end, float(best_e - 1))
+
+
+def _extend_window(
+    child_t,
+    parent_t,
+    hits: Sequence[Tuple[int, int, float]],
+    best_s: int,
+    best_e: int,  # exclusive
+    child_len: int,
+    parent_len: int,
+    *,
+    normalize: bool,
+    min_sim: float = 0.55,
+    cap_ratio: float = 1.0,
+    margin: int = 3,
+    gap: int = 1,
+) -> Tuple[int, int]:
+    """
+    Grow the selected parent window outward to cover child content that hit-coverage
+    alone misses (e.g. a proper-noun-dense tail or a head section whose chunk embeds
+    poorly), while refusing to cross into unrelated neighbouring material.
+
+    Two signals are combined:
+
+    * **Diagonal bound** (``_diagonal_bounds``): from the child length and the local
+      slope of the anchor diagonal, how far the window *should* reach on each side.
+      This caps growth so the window cannot run into the preceding/following section
+      of the same source just because it is the same domain.
+    * **Similarity gate**: walking outward from each window edge (up to the diagonal
+      bound ± ``margin``), keep extending while the boundary parent chunk's max cosine
+      similarity to any child chunk stays ``>= min_sim``; stop after ``gap`` chunks
+      below it. Related-but-poorly-aligned content (~0.6) is kept, while genuinely
+      unrelated material (a foreign-language bibliography, ~0.45) ends the growth.
+
+    Returns the grown ``(start, end_exclusive)``; never shrinks the input window.
+    """
+    import torch.nn.functional as F
+
+    est_start, est_end = _diagonal_bounds(hits, best_s, best_e, child_len, cap_ratio=cap_ratio)
+    bound_s = max(0, int(np.floor(est_start)) - margin)
+    bound_e = min(parent_len, int(np.ceil(est_end)) + 1 + margin)
+
+    C = F.normalize(child_t, p=2, dim=1) if normalize else child_t
+    P = F.normalize(parent_t, p=2, dim=1) if normalize else parent_t
+    per_parent = (P @ C.T).max(dim=1).values.detach().cpu().numpy()
+
+    new_s = best_s
+    misses = 0
+    for p in range(best_s - 1, bound_s - 1, -1):
+        if per_parent[p] >= min_sim:
+            new_s = p
+            misses = 0
+        else:
+            misses += 1
+            if misses > gap:
+                break
+
+    new_e = best_e
+    misses = 0
+    for p in range(best_e, bound_e):
+        if per_parent[p] >= min_sim:
+            new_e = p + 1
+            misses = 0
+        else:
+            misses += 1
+            if misses > gap:
+                break
+
+    return new_s, new_e
+
+
+# =============================================================================
+# Sentence-boundary snapping for exported char offsets
+# =============================================================================
+
+# Sentence terminators for both Vietnamese (Latin) and SinoNom/Chinese (CJK),
+# plus newline. The chunk char offsets come from fixed token windows, so a span's
+# raw [char_start, char_end) almost always lands mid-sentence; snapping to these
+# boundaries makes the exported text read as whole sentences.
+_SENT_END = set(".!?…。！？\n")
+_SNAP_WS = set(" \t\n\r")
+
+
+def _snap_span_to_sentence(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    max_extend: int = 400,
+) -> Tuple[int, int]:
+    """
+    Expand a raw character span ``[start, end)`` outward to the nearest sentence
+    boundaries, without crossing more than ``max_extend`` characters on either
+    side.
+
+    - start: if it lands inside a sentence, move back to just after the previous
+      terminator so the span opens on a whole sentence.
+    - end: if it lands inside a sentence, move forward to include the rest of the
+      current sentence (through its terminator).
+
+    Already-clean boundaries are left untouched. Returns the snapped ``(start, end)``;
+    falls back to the original bounds when no terminator is found within range.
+    """
+    n = len(text)
+    if not text or start < 0 or end <= start:
+        return start, end
+    start = max(0, min(start, n))
+    end = max(0, min(end, n))
+
+    # --- START: only move if currently mid-sentence ---
+    k = start - 1
+    while k >= 0 and text[k] in (" \t"):
+        k -= 1
+    if k >= 0 and text[k] not in _SENT_END:
+        lo = max(0, start - max_extend)
+        i = start - 1
+        while i >= lo:
+            if text[i] in _SENT_END:
+                new_s = i + 1
+                while new_s < start and text[new_s] in _SNAP_WS:
+                    new_s += 1
+                start = new_s
+                break
+            i -= 1
+
+    # --- END: only move if currently mid-sentence ---
+    j = end - 1
+    while j >= start and text[j] in _SNAP_WS:
+        j -= 1
+    if j >= start and text[j] not in _SENT_END:
+        hi = min(n, end + max_extend)
+        k = end
+        while k < hi:
+            if text[k] in _SENT_END:
+                end = k + 1
+                break
+            k += 1
+
+    return start, end
 
 
 # =============================================================================
@@ -280,6 +549,8 @@ def _empty_debug() -> Dict[str, Any]:
         "best_score_start_chunk": -1,
         "best_score_end_chunk": -1,
         "best_window_length": 0,
+        "extend_start_chunk": -1,
+        "extend_end_chunk": -1,
         "reason": "",
     }
 
@@ -293,9 +564,14 @@ def localize_document_pair(
     top_k_hits: int = 3,
     hit_min_similarity: Optional[float] = None,
     min_child_length_ratio: float = 0.8,
-    max_child_length_ratio: float = 3.0,
+    max_child_length_ratio: float = 1.7,
     top_windows: int = 10,
     context_chunks: int = 1,
+    trim_min_sim: float = 0.0,
+    extend_window: bool = True,
+    extend_min_sim: float = 0.55,
+    extend_cap_ratio: float = 1.0,
+    extend_margin: int = 3,
     normalize: bool = True,
     device: str = "cpu",
     verbose: bool = False,
@@ -305,9 +581,20 @@ def localize_document_pair(
 
     Directional document-level Bimax picks the child (more fully covered) and the
     parent. Local retrieval (child vs this parent only) proposes parent positions;
-    candidate windows are formed from those positions, ranked by hit coverage, and
-    the kept windows are scored with symmetric mean Bimax. The parent side is
-    padded by ``context_chunks`` for export (scores untouched).
+    candidate windows are formed from those positions and ranked by hit coverage.
+    The window covering the MOST distinct child chunks is chosen (ties broken by
+    symmetric mean Bimax) so the span reaches the full extent of the child's
+    content -- including tails whose vocabulary differs from the bulk. ``max_len``
+    (via ``max_child_length_ratio``) caps how far an outlier hit can stretch the
+    window. Optional boundary trimming (``trim_min_sim`` > 0) removes low-similarity
+    edge chunks; it is OFF by default to favour completeness.
+
+    When ``extend_window`` is on (default), the export window is grown to reach child
+    content that hit-coverage misses (a proper-noun-dense tail, or a head whose chunk
+    embeds poorly), bounded by the child->parent diagonal and gated by boundary
+    similarity (``extend_min_sim``) so it never crosses into unrelated neighbouring
+    material (e.g. a foreign-language bibliography). The Bimax score stays on the
+    coverage-selected window. The parent side is finally padded by ``context_chunks``.
 
     Returns ``(LocalizedSpan, debug)`` on success, or ``(None, debug)`` when the
     pair is skipped (debug always carries a ``reason``).
@@ -369,23 +656,47 @@ def localize_document_pair(
     max_len = max(min_len, min(max_len, parent_len))
 
     top = propose_and_rank_windows(
-        hits, parent_len, min_len=min_len, max_len=max_len, top_windows=top_windows
+        hits, parent_len,
+        min_len=min_len, max_len=max_len, top_windows=top_windows,
     )
     debug["candidate_window_count"] = len(top)
     if not top:
         debug["reason"] = "no_valid_candidates"
         return None, debug
 
-    # 7. Symmetric mean Bimax over the kept windows; pick the best.
+    # 7. Pick the window covering the MOST distinct child chunks (completeness:
+    #    reach the full extent of the child's content even where the tail uses
+    #    different vocabulary), breaking ties by the symmetric mean Bimax. Bimax
+    #    is the reported score but no longer the selector -- picking by Bimax mean
+    #    truncates low-similarity tails (the "cắt cụt" failure mode).
     cand_windows = [(s, e) for (s, e, _cov) in top]
     scored = score_candidates(child_t, parent_t, cand_windows, normalize)
-    best_score, best_s, best_e, c2w, w2c = scored[0]
+    cov_by = {(s, e): cov for (s, e, cov) in top}
+    best_score, best_s, best_e, c2w, w2c = max(
+        scored, key=lambda x: (cov_by[(x[1], x[2])], x[0])
+    )
 
-    debug["best_coverage"] = next((cov for (s, e, cov) in top if s == best_s and e == best_e), -1)
+    debug["best_coverage"] = cov_by.get((best_s, best_e), -1)
+    debug["reason"] = "ok"
+
+    # 7b. Boundary trimming: remove parent chunks at the window edges that have
+    #     low max-similarity to the child. Reduces p2c < c2p asymmetry and tightens
+    #     the span to where matching content actually starts/ends.
+    if trim_min_sim > 0.0:
+        trim_s, trim_e = _trim_window_bounds(
+            child_t, parent_t, best_s, best_e,
+            normalize=normalize,
+            min_sim=trim_min_sim,
+            min_len=max(1, min_len),
+        )
+        if (trim_s, trim_e) != (best_s, best_e):
+            c2w, w2c = _score_window(child_t, parent_t, trim_s, trim_e, normalize)
+            best_s, best_e = trim_s, trim_e
+            best_score = 0.5 * (c2w + w2c)
+
     debug["best_score_start_chunk"] = best_s
     debug["best_score_end_chunk"] = best_e - 1
     debug["best_window_length"] = best_e - best_s
-    debug["reason"] = "ok"
 
     if verbose:
         print(
@@ -395,11 +706,26 @@ def localize_document_pair(
         )
         for sc, s, e, a, b in scored[:5]:
             print(f"      cand [{s}..{e - 1}] len={e - s} score={sc:.4f} c2p={a:.3f} p2c={b:.3f}")
+        print(f"      -> final [{best_s}..{best_e - 1}] len={best_e - best_s} score={best_score:.4f}")
 
     # 8. Score span -> export span (pad parent only; child stays whole).
+    #    Window extension (export-only, not re-scored) grows the window to cover child
+    #    content that hit-coverage misses -- a proper-noun-dense tail, or a head whose
+    #    chunk embeds poorly -- bounded by the child->parent diagonal and gated by
+    #    boundary similarity so it never crosses into unrelated neighbouring material.
+    #    The Bimax score stays on the coverage-selected window [best_s, best_e).
     score_start, score_end_excl = best_s, best_e
-    export_start = max(0, score_start - context_chunks)
-    export_end = min(parent_len, score_end_excl + context_chunks)
+    ext_s, ext_e = (best_s, best_e)
+    if extend_window:
+        ext_s, ext_e = _extend_window(
+            child_t, parent_t, hits, best_s, best_e, child_len, parent_len,
+            normalize=normalize, min_sim=extend_min_sim,
+            cap_ratio=extend_cap_ratio, margin=extend_margin,
+        )
+        debug["extend_start_chunk"] = ext_s
+        debug["extend_end_chunk"] = ext_e - 1
+    export_start = max(0, ext_s - context_chunks)
+    export_end = min(parent_len, ext_e + context_chunks)
 
     if src_is_child:
         # src = child (whole), tar = parent
@@ -469,6 +795,28 @@ def localize_spans_for_pairs(
     verbose = getattr(args, "verbose", False)
     save_debug = getattr(args, "save_span_debug", False)
     device = getattr(args, "device", "cpu") or "cpu"
+    snap_chars = getattr(args, "span_snap_max_chars", 400)
+
+    # Cache raw document text per path so sentence-snapping reads each file once.
+    _text_cache: Dict[str, str] = {}
+
+    def _doc_text(path: Optional[str]) -> Optional[str]:
+        if not path:
+            return None
+        if path not in _text_cache:
+            try:
+                _text_cache[path] = AlignerIO.load_document_text(path)
+            except Exception:
+                _text_cache[path] = None
+        return _text_cache[path]
+
+    def _snap(path: Optional[str], cs: int, ce: int) -> Tuple[int, int]:
+        if snap_chars <= 0 or cs < 0 or ce < 0:
+            return cs, ce
+        txt = _doc_text(path)
+        if not txt:
+            return cs, ce
+        return _snap_span_to_sentence(txt, cs, ce, max_extend=snap_chars)
 
     # Group candidate targets per source document, keep top-k by document score.
     by_src: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
@@ -510,6 +858,11 @@ def localize_spans_for_pairs(
                 max_child_length_ratio=args.span_max_child_length_ratio,
                 top_windows=args.span_top_windows,
                 context_chunks=getattr(args, "span_context_chunks", 1),
+                trim_min_sim=getattr(args, "span_trim_min_sim", 0.0),
+                extend_window=not getattr(args, "span_no_extend", False),
+                extend_min_sim=getattr(args, "span_extend_min_sim", 0.55),
+                extend_cap_ratio=getattr(args, "span_extend_cap_ratio", 1.0),
+                extend_margin=getattr(args, "span_extend_margin", 3),
                 normalize=True,
                 device=device,
                 verbose=verbose,
@@ -524,6 +877,12 @@ def localize_spans_for_pairs(
                         "document_score": float(doc_score), **fdbg,
                     })
                 continue
+
+            # Snap the chunk-derived char offsets to sentence boundaries so the
+            # exported spans (and TSV) don't start/end mid-sentence. Chunk indices
+            # and scores are unaffected.
+            src_cs, src_ce = _snap(s_path, span.source_start_char, span.source_end_char)
+            tar_cs, tar_ce = _snap(t_path, span.target_start_char, span.target_end_char)
 
             rows.append({
                 # TSV columns
@@ -547,10 +906,10 @@ def localize_spans_for_pairs(
                 "tar_score_end_chunk": span.tar_score_end_chunk,
                 "tar_start_chunk": span.target_start_chunk,
                 "tar_end_chunk": span.target_end_chunk,
-                "src_start_char": span.source_start_char,
-                "src_end_char": span.source_end_char,
-                "tar_start_char": span.target_start_char,
-                "tar_end_char": span.target_end_char,
+                "src_start_char": src_cs,
+                "src_end_char": src_ce,
+                "tar_start_char": tar_cs,
+                "tar_end_char": tar_ce,
                 # Internal fields for span export (not written to TSV)
                 "_src_file_path": s_path,
                 "_tar_file_path": t_path,
@@ -793,14 +1152,41 @@ def build_span_parser():
                         help="Drop retrieval hits below this cosine similarity (default: no floor).")
     parser.add_argument("--span_min_child_length_ratio", type=float, default=0.8,
                         help="Minimum candidate window length as a fraction of the child length.")
-    parser.add_argument("--span_max_child_length_ratio", type=float, default=3.0,
-                        help="Maximum candidate window length as a fraction of the child length.")
+    parser.add_argument("--span_max_child_length_ratio", type=float, default=1.7,
+                        help="Maximum candidate window length as a fraction of the child length. "
+                             "Caps how far an outlier hit can stretch the parent window; "
+                             "SinoNom->Vietnamese expands ~1.2-1.6x so 1.7 is a safe ceiling.")
     parser.add_argument("--span_top_windows", type=int, default=10,
-                        help="Number of coverage-ranked candidate windows kept for Bimax scoring.")
+                        help="Number of coverage-efficiency-ranked candidate windows kept for Bimax scoring.")
     parser.add_argument("--span_context_chunks", type=int, default=1,
                         help="Chunks to pad on each side of the score window for the "
-                             "export span passed to Vecalign. Scores are not recomputed "
-                             "after padding. Set 0 to disable padding.")
+                             "export span passed to Vecalign. Set 0 to disable padding.")
+    parser.add_argument("--span_trim_min_sim", type=float, default=0.0,
+                        help="Boundary trim threshold: parent chunks at the window edges whose "
+                             "max cosine-sim to any child chunk is below this value are removed "
+                             "before padding. OFF by default (0.0) to favour completeness; raise "
+                             "(e.g. 0.2) only if you want tighter spans at the cost of recall.")
+    parser.add_argument("--span_snap_max_chars", type=int, default=400,
+                        help="Snap exported span char offsets to the nearest sentence boundary, "
+                             "extending at most this many characters per side (token-chunk offsets "
+                             "otherwise cut mid-sentence). Set 0 to disable snapping. (default: 400)")
+    parser.add_argument("--span_no_extend", action="store_true",
+                        help="Disable window extension. By default the export window is grown to cover "
+                             "child content that hit-coverage misses (proper-noun-dense tails, or heads "
+                             "whose chunk embeds poorly), bounded by the diagonal and gated by boundary "
+                             "similarity so it never crosses into unrelated neighbouring material.")
+    parser.add_argument("--span_extend_min_sim", type=float, default=0.55,
+                        help="Boundary similarity gate for window extension: keep growing while the "
+                             "edge parent chunk's max cosine-sim to any child chunk is >= this value. "
+                             "Separates related-but-weak content (~0.6) from unrelated material like a "
+                             "foreign-language bibliography (~0.45). (default: 0.55)")
+    parser.add_argument("--span_extend_cap_ratio", type=float, default=1.0,
+                        help="Cap the diagonal extent estimate (which bounds extension) at this multiple "
+                             "of the selected window length per side. (default: 1.0)")
+    parser.add_argument("--span_extend_margin", type=int, default=3,
+                        help="Allow the similarity gate to grow this many chunks beyond the diagonal "
+                             "bound, to catch boundary content the diagonal underestimates when the "
+                             "edge child chunk does not anchor. (default: 3)")
     parser.add_argument("--device", type=str, default=None,
                         help="torch device for retrieval/Bimax (default: cuda if available else cpu).")
 
